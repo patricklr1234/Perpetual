@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.35.0-v50-inherited-protect-reset-fix"
+VERSION = "5.36.0-v51-inherited-macd-protect-reset"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -113,6 +113,7 @@ EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") 
 RETIRE_LEGACY_PYRAMID_ON_STARTUP = os.getenv("RETIRE_LEGACY_PYRAMID_ON_STARTUP", "1") == "1"
 RETIRE_LEGACY_RANGE_ON_STARTUP = os.getenv("RETIRE_LEGACY_RANGE_ON_STARTUP", "1") == "1"
 RESET_INHERITED_RANGE_PROTECT_ON_STARTUP = os.getenv("RESET_INHERITED_RANGE_PROTECT_ON_STARTUP", "1") == "1"
+RESET_INHERITED_MACD_PROTECT_ON_STARTUP = os.getenv("RESET_INHERITED_MACD_PROTECT_ON_STARTUP", "1") == "1"
 EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -4419,6 +4420,126 @@ class Bot:
             [x["grid"] for x in reset_grids],
         )
 
+    def reset_inherited_macd_protect_state(self) -> None:
+        """One-shot cleanup of inherited MACD recovery/protect state.
+
+        Accounting is preserved. The routine resets only operational recovery state and
+        only after proving the six configured MACD strategies are logically and physically flat.
+        This prevents historical PROTECT/RD/streak from blocking the current architecture while
+        ensuring a legitimate live/current position can never be erased by startup maintenance.
+        """
+        if not RESET_INHERITED_MACD_PROTECT_ON_STARTUP:
+            logger.info("INHERITED MACD PROTECT RESET | disabled")
+            return
+
+        maintenance = self.store.state.setdefault("maintenance", {})
+        marker = maintenance.setdefault("macd_inherited_protect_reset_v51", {})
+        if marker.get("completed"):
+            self.store.set_operational_block("INHERITED_MACD_PROTECT_RESET", None)
+            logger.info("INHERITED MACD PROTECT RESET | one-shot ja concluido anteriormente")
+            return
+
+        candidates = []
+        with self.store.lock:
+            for key, st in self.store.state.get("macd", {}).items():
+                if not isinstance(st, dict):
+                    continue
+                symbol = str(st.get("symbol") or "").upper()
+                tf = str(st.get("tf") or "")
+                if symbol not in SYMBOLS or tf not in MACD_TIMEFRAMES:
+                    continue
+                if st.get("position"):
+                    continue
+                if (bool(st.get("protect")) or dec(st.get("recovery_deficit")) > 0
+                        or int(st.get("loss_streak", 0) or 0) > 0
+                        or int(st.get("recovery_level", 0) or 0) > 0):
+                    candidates.append((symbol, tf, key))
+
+        if not candidates:
+            marker.update({
+                "completed": True, "completed_at": now_iso(), "version": VERSION,
+                "reason": "NO_INHERITED_MACD_PROTECT_CANDIDATES", "reset_macd": [],
+            })
+            self.store.save()
+            self.store.set_operational_block("INHERITED_MACD_PROTECT_RESET", None)
+            logger.info("INHERITED MACD PROTECT RESET | nenhum PROTECT/RD/streak herdado elegivel")
+            return
+
+        self.store.set_operational_block(
+            "INHERITED_MACD_PROTECT_RESET", "ONE_SHOT_INHERITED_MACD_PROTECT_RESET_IN_PROGRESS"
+        )
+
+        rows = self.client.positions()
+        physical = {}
+        for r in rows if isinstance(rows, list) else []:
+            sym = str(r.get("symbol") or "").upper()
+            if sym not in SYMBOLS:
+                continue
+            ps = str(r.get("positionSide") or "").upper()
+            if ps not in ("LONG", "SHORT"):
+                continue
+            physical[(sym, ps)] = abs(dec(r.get("positionAmt")))
+
+        target_symbols = sorted({symbol for symbol, _tf, _key in candidates})
+        for symbol in target_symbols:
+            step = self.rules.rules[symbol].step_size
+            for side in ("LONG", "SHORT"):
+                qty = physical.get((symbol, side), D(0))
+                if qty > max(step, D("0.00000001")):
+                    reason = f"PHYSICAL_NOT_FLAT:{symbol}:{side}:{qty}"
+                    self.store.set_operational_block("INHERITED_MACD_PROTECT_RESET", reason)
+                    raise RuntimeError(f"INHERITED MACD PROTECT RESET | ABORT | {reason}")
+
+        for symbol, tf, _key in candidates:
+            strategy_id = f"MACD:{symbol}:{tf}"
+            for side in ("LONG", "SHORT"):
+                q = self.ledger.open_strategy_qty(strategy_id, symbol, side)
+                if q > 0:
+                    reason = f"LEDGER_NOT_FLAT:{strategy_id}:{side}:{q}"
+                    self.store.set_operational_block("INHERITED_MACD_PROTECT_RESET", reason)
+                    raise RuntimeError(f"INHERITED MACD PROTECT RESET | ABORT | {reason}")
+
+        reset_macd = []
+        with self.store.lock:
+            for symbol, tf, key in candidates:
+                st = self.store.state.get("macd", {}).get(key) or {}
+                if st.get("position"):
+                    reason = f"POSITION_PRESENT:{key}"
+                    self.store.set_operational_block("INHERITED_MACD_PROTECT_RESET", reason)
+                    raise RuntimeError(f"INHERITED MACD PROTECT RESET | ABORT | {reason}")
+                old_protect = bool(st.get("protect"))
+                old_rd = dec(st.get("recovery_deficit"))
+                old_streak = int(st.get("loss_streak", 0) or 0)
+                old_level = int(st.get("recovery_level", 0) or 0)
+                old_pa = st.get("protect_anchor")
+                if not (old_protect or old_rd > 0 or old_streak > 0 or old_level > 0):
+                    continue
+                st["recovery_deficit"] = "0"
+                st["loss_streak"] = 0
+                st["recovery_level"] = 0
+                st["protect"] = False
+                st["protect_anchor"] = None
+                st["last_result"] = "INHERITED_MACD_PROTECT_RESET_V51"
+                st["last_update"] = now_iso()
+                reset_macd.append({
+                    "macd": key, "old_protect": old_protect, "old_rd": str(old_rd),
+                    "old_streak": old_streak, "old_recovery_level": old_level,
+                    "old_protect_anchor": old_pa, "equity_preserved": str(st.get("equity")),
+                    "realized_pnl_preserved": str(st.get("realized_pnl")),
+                })
+            marker.update({
+                "completed": True, "completed_at": now_iso(), "version": VERSION,
+                "reason": "INHERITED_MACD_PROTECT_CLEARED", "reset_macd": reset_macd,
+            })
+            self.store.save()
+
+        self.store.set_operational_block("INHERITED_MACD_PROTECT_RESET", None)
+        logger.warning(
+            "INHERITED MACD PROTECT RESET | CONCLUIDO | macd=%s | "
+            "equity/realized_pnl/last_candle preservados; RD/streak/recovery_level/protect herdados zerados",
+            [x["macd"] for x in reset_macd],
+        )
+
     def retire_legacy_range_positions(self) -> None:
         """One-shot retirement of pre-subgrid RANGE baskets.
 
@@ -4782,6 +4903,7 @@ class Bot:
         logger.info(f"LEGACY PYRAMID RETIRE | enabled={RETIRE_LEGACY_PYRAMID_ON_STARTUP} | mode=LEDGER_OWNED_ONLY")
         logger.info(f"LEGACY RANGE RETIRE | enabled={RETIRE_LEGACY_RANGE_ON_STARTUP} | mode=ONE_SHOT_LEDGER_OWNED_ONLY")
         logger.info(f"INHERITED RANGE PROTECT RESET | enabled={RESET_INHERITED_RANGE_PROTECT_ON_STARTUP} | mode=ONE_SHOT_STATE_ONLY_ACCOUNTING_PRESERVED")
+        logger.info(f"INHERITED MACD PROTECT RESET | enabled={RESET_INHERITED_MACD_PROTECT_ON_STARTUP} | mode=ONE_SHOT_STATE_ONLY_ACCOUNTING_PRESERVED")
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -4817,6 +4939,7 @@ class Bot:
             if LIVE_TRADING:
                 self._refresh_range_grid_migrations()
                 self.reset_inherited_range_protect_state()
+                self.reset_inherited_macd_protect_state()
             else:
                 logger.info("RANGE GRID MIGRATION | SKIP | LIVE_TRADING=0; startup de simulacao nao migra estado persistido")
             for symbol in SYMBOLS:
@@ -5047,6 +5170,35 @@ class Bot:
                     logger.info(f"RANGE PRICE MONITOR | {e.symbol} | status={status} anchor_fixado=AGUARDANDO_PRIMEIRO_PRECO")
             except Exception as ex:
                 logger.warning(f"RANGE PRICE MONITOR FAIL | {e.symbol} | {ex}")
+        # MACD MONITOR: visibility only; no extra REST/klines calls are made here.
+        # It shows whether each engine is free, protected or in-position, plus the remaining
+        # protect-rearm distance when applicable. Cross/open/close events continue to be logged
+        # by MacdEngine itself on closed candles.
+        for e in self.macd_engines:
+            try:
+                mst = e.st()
+                mark = self.md.get(e.symbol)
+                pos = mst.get("position")
+                protected = bool(mst.get("protect"))
+                status = "POSITION" if pos else ("PROTECT" if protected else "IDLE")
+                pa = dec(mst.get("protect_anchor"))
+                move_pct = None
+                falta_pct = None
+                if protected and pa > 0 and mark is not None and mark > 0:
+                    move_pct = abs(pct_change(pa, mark)) * D(100)
+                    falta_pct = max(D(0), (MACD_REARM_PCT - abs(pct_change(pa, mark))) * D(100))
+                logger.info(
+                    "MACD MONITOR | %s | status=%s mark=%s RD=%s streak=%s recovery_level=%s "
+                    "protect_anchor=%s move_protect=%s faltam_rearm=%s last_candle_close_ms=%s",
+                    e.id, status, mark if mark is not None else "INDISPONIVEL",
+                    mst.get("recovery_deficit"), mst.get("loss_streak"), mst.get("recovery_level"),
+                    mst.get("protect_anchor"),
+                    (f"{move_pct:.6f}%" if move_pct is not None else "-"),
+                    (f"{falta_pct:.6f}%" if falta_pct is not None else "-"),
+                    mst.get("last_candle_close_ms", 0),
+                )
+            except Exception as ex:
+                logger.warning("MACD MONITOR FAIL | %s | %s", e.id, ex)
         with self.news._lock:
             news_events = len(self.news.events)
             news_source = self.news.last_source
