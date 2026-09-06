@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.32.0-v47-legacy-range-cleanup"
+VERSION = "5.34.0-v49-inherited-protect-reset"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -112,6 +112,7 @@ VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
 RETIRE_LEGACY_PYRAMID_ON_STARTUP = os.getenv("RETIRE_LEGACY_PYRAMID_ON_STARTUP", "1") == "1"
 RETIRE_LEGACY_RANGE_ON_STARTUP = os.getenv("RETIRE_LEGACY_RANGE_ON_STARTUP", "1") == "1"
+RESET_INHERITED_RANGE_PROTECT_ON_STARTUP = os.getenv("RESET_INHERITED_RANGE_PROTECT_ON_STARTUP", "1") == "1"
 EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -3485,14 +3486,24 @@ class RangeEngine:
             anchor = dec(st["anchor"])
             if status == "PROTECT":
                 pa = dec(st.get("protect_anchor") or anchor)
-                move = abs(pct_change(pa, price))
+                signed_move = pct_change(pa, price)
+                move = abs(signed_move)
                 if move >= RANGE_REARM_PCT:
-                    st["status"] = "IDLE"
-                    st["anchor"] = str(self._anchor_from_price(price))
-                    st["protect_anchor"] = None
-                    st["failures"] = 0
-                    self.store.save()
-                    logger.info(f"RANGE PROTECT LIBERADO | {self.symbol} | move={move} | new_anchor={price} | RD={st['recovery_deficit']}")
+                    # V48: os 3% do PROTECT sao o proprio gatilho de reentrada.
+                    # Nao reancorar no preco atual e exigir RANGE_TRIGGER_PCT adicional,
+                    # pois isso transformaria a regra efetiva em 3% + 1%.
+                    # Se a abertura for bloqueada (news/risk/margem/gate), _start_basket
+                    # retorna sem alterar PROTECT; assim o robô tenta novamente enquanto
+                    # o preco permanecer alem do limiar de 3%.
+                    if not self.allow_new_entries:
+                        return
+                    side = "LONG" if signed_move > 0 else "SHORT"
+                    logger.info(
+                        f"RANGE PROTECT 3PCT TRIGGER | {self.symbol} grid={self.grid_id} | "
+                        f"side={side} protect_anchor={pa} price={price} move={signed_move} "
+                        f"threshold={RANGE_REARM_PCT} RD={st['recovery_deficit']}"
+                    )
+                    self._start_basket(side, price)
                 return
             if status == "IDLE":
                 if not self.allow_new_entries:
@@ -4289,6 +4300,125 @@ class Bot:
         for symbol in SYMBOLS:
             self._migrate_legacy_range_to_grids_if_flat(symbol)
 
+    def reset_inherited_range_protect_state(self) -> None:
+        """One-shot cleanup of PROTECT/RD inherited from the pre-subgrid RANGE state.
+
+        This is deliberately state-only: it never closes positions and never erases
+        equity/realized PnL. Only flat, ledger-empty G0-G3 buckets that can still be
+        proven to be untouched migration artifacts (last_result=MIGRATED_FROM_LEGACY_V19)
+        are reset. New/current PROTECT states are never eligible.
+        """
+        if not RESET_INHERITED_RANGE_PROTECT_ON_STARTUP:
+            logger.warning("INHERITED RANGE PROTECT RESET | DESABILITADO por configuracao")
+            return
+
+        maintenance = self.store.state.setdefault("maintenance", {})
+        marker = maintenance.setdefault("range_inherited_protect_reset_v49", {})
+        if marker.get("completed"):
+            self.store.set_operational_block("INHERITED_RANGE_PROTECT_RESET", None)
+            logger.info("INHERITED RANGE PROTECT RESET | one-shot ja concluido anteriormente")
+            return
+
+        candidates = []
+        for symbol in SYMBOLS:
+            if not self._range_grid_migrated(symbol):
+                continue
+            for i, _phase in enumerate(RANGE_GRID_PHASES):
+                key = f"{symbol}:G{i}"
+                st = self.store.state.get("range_grids", {}).get(key) or {}
+                if str(st.get("last_result") or "") != "MIGRATED_FROM_LEGACY_V19":
+                    continue
+                if str(st.get("status", "IDLE")).upper() == "PROTECT" or dec(st.get("recovery_deficit")) > 0:
+                    candidates.append((symbol, key))
+
+        if not candidates:
+            marker.update({
+                "completed": True, "completed_at": now_iso(), "version": VERSION,
+                "reason": "NO_INHERITED_PROTECT_CANDIDATES", "reset_grids": [],
+            })
+            self.store.save()
+            self.store.set_operational_block("INHERITED_RANGE_PROTECT_RESET", None)
+            logger.info("INHERITED RANGE PROTECT RESET | nenhum PROTECT/RD herdado elegivel")
+            return
+
+        self.store.set_operational_block(
+            "INHERITED_RANGE_PROTECT_RESET", "ONE_SHOT_INHERITED_RANGE_PROTECT_RESET_IN_PROGRESS"
+        )
+
+        # Prove that no physical exposure exists on any symbol we are about to mutate.
+        rows = self.client.positions()
+        physical = {}
+        for r in rows if isinstance(rows, list) else []:
+            sym = str(r.get("symbol") or "").upper()
+            if sym not in SYMBOLS:
+                continue
+            ps = str(r.get("positionSide") or "").upper()
+            if ps not in ("LONG", "SHORT"):
+                continue
+            physical[(sym, ps)] = abs(dec(r.get("positionAmt")))
+
+        target_symbols = sorted({sym for sym, _key in candidates})
+        for symbol in target_symbols:
+            step = self.rules.step(symbol)
+            for side in ("LONG", "SHORT"):
+                if physical.get((symbol, side), D(0)) > max(step, D("0.00000001")):
+                    reason = f"PHYSICAL_NOT_FLAT:{symbol}:{side}:{physical.get((symbol, side), D(0))}"
+                    self.store.set_operational_block("INHERITED_RANGE_PROTECT_RESET", reason)
+                    raise RuntimeError(f"INHERITED RANGE PROTECT RESET | ABORT | {reason}")
+
+        # Also prove every candidate strategy is ledger-flat.
+        for symbol, key in candidates:
+            gid = key.split(":", 1)[1]
+            strategy_id = f"RANGE:{symbol}:{gid}"
+            for side in ("LONG", "SHORT"):
+                q = self.ledger.open_strategy_qty(strategy_id, symbol, side)
+                if q > 0:
+                    reason = f"LEDGER_NOT_FLAT:{strategy_id}:{side}:{q}"
+                    self.store.set_operational_block("INHERITED_RANGE_PROTECT_RESET", reason)
+                    raise RuntimeError(f"INHERITED RANGE PROTECT RESET | ABORT | {reason}")
+
+        reset_grids = []
+        with self.store.lock:
+            for symbol, key in candidates:
+                st = self.store.state.get("range_grids", {}).get(key) or {}
+                # Re-check inside the state lock. A new/current state is never reset.
+                if st.get("basket"):
+                    reason = f"BASKET_PRESENT:{key}"
+                    self.store.set_operational_block("INHERITED_RANGE_PROTECT_RESET", reason)
+                    raise RuntimeError(f"INHERITED RANGE PROTECT RESET | ABORT | {reason}")
+                if str(st.get("last_result") or "") != "MIGRATED_FROM_LEGACY_V19":
+                    continue
+                old_status = str(st.get("status", "IDLE"))
+                old_rd = dec(st.get("recovery_deficit"))
+                old_pa = st.get("protect_anchor")
+                if old_status.upper() != "PROTECT" and old_rd <= 0:
+                    continue
+                # Preserve accounting. Reset only inherited operational recovery/protect state.
+                st["recovery_deficit"] = "0"
+                st["status"] = "IDLE"
+                st["protect_anchor"] = None
+                st["anchor"] = None
+                st["failures"] = 0
+                st["last_result"] = "INHERITED_PROTECT_RESET_V49"
+                st["last_update"] = now_iso()
+                reset_grids.append({
+                    "grid": key, "old_status": old_status, "old_rd": str(old_rd),
+                    "old_protect_anchor": old_pa, "equity_preserved": str(st.get("equity")),
+                    "realized_pnl_preserved": str(st.get("realized_pnl")),
+                })
+            marker.update({
+                "completed": True, "completed_at": now_iso(), "version": VERSION,
+                "reason": "INHERITED_PROTECT_CLEARED", "reset_grids": reset_grids,
+            })
+            self.store.save()
+
+        self.store.set_operational_block("INHERITED_RANGE_PROTECT_RESET", None)
+        logger.warning(
+            "INHERITED RANGE PROTECT RESET | CONCLUIDO | grids=%s | "
+            "equity/realized_pnl preservados; RD/protect/anchors herdados zerados",
+            [x["grid"] for x in reset_grids],
+        )
+
     def retire_legacy_range_positions(self) -> None:
         """One-shot retirement of pre-subgrid RANGE baskets.
 
@@ -4651,6 +4781,7 @@ class Bot:
         logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD}")
         logger.info(f"LEGACY PYRAMID RETIRE | enabled={RETIRE_LEGACY_PYRAMID_ON_STARTUP} | mode=LEDGER_OWNED_ONLY")
         logger.info(f"LEGACY RANGE RETIRE | enabled={RETIRE_LEGACY_RANGE_ON_STARTUP} | mode=ONE_SHOT_LEDGER_OWNED_ONLY")
+        logger.info(f"INHERITED RANGE PROTECT RESET | enabled={RESET_INHERITED_RANGE_PROTECT_ON_STARTUP} | mode=ONE_SHOT_STATE_ONLY_ACCOUNTING_PRESERVED")
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -4685,6 +4816,7 @@ class Bot:
             self.range_engines = []
             if LIVE_TRADING:
                 self._refresh_range_grid_migrations()
+                self.reset_inherited_range_protect_state()
             else:
                 logger.info("RANGE GRID MIGRATION | SKIP | LIVE_TRADING=0; startup de simulacao nao migra estado persistido")
             for symbol in SYMBOLS:
