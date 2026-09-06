@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.31.0-v46-log-regression-hardened"
+VERSION = "5.32.0-v47-legacy-range-cleanup"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -111,6 +111,7 @@ LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
 VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
 RETIRE_LEGACY_PYRAMID_ON_STARTUP = os.getenv("RETIRE_LEGACY_PYRAMID_ON_STARTUP", "1") == "1"
+RETIRE_LEGACY_RANGE_ON_STARTUP = os.getenv("RETIRE_LEGACY_RANGE_ON_STARTUP", "1") == "1"
 EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -4288,6 +4289,202 @@ class Bot:
         for symbol in SYMBOLS:
             self._migrate_legacy_range_to_grids_if_flat(symbol)
 
+    def retire_legacy_range_positions(self) -> None:
+        """One-shot retirement of pre-subgrid RANGE baskets.
+
+        Only closes exposure proven to belong to the legacy RANGE:{symbol} strategy.
+        Current RANGE:G0-G3 and MACD ownership is preserved. If state, ledger and
+        physical quantities cannot be reconciled safely, the routine fails closed.
+        """
+        if not RETIRE_LEGACY_RANGE_ON_STARTUP:
+            logger.warning("LEGACY RANGE RETIRE | DESABILITADO por configuracao")
+            return
+
+        maintenance = self.store.state.setdefault("maintenance", {})
+        marker = maintenance.setdefault("legacy_range_retirement_v47", {})
+        if marker.get("completed"):
+            self.store.set_operational_block("LEGACY_RANGE_RETIRE", None)
+            logger.info("LEGACY RANGE RETIRE | one-shot ja concluido anteriormente")
+            return
+
+        legacy_symbols = []
+        for symbol in SYMBOLS:
+            st = self.store.state.get("range", {}).get(symbol) or {}
+            if st.get("basket"):
+                legacy_symbols.append(symbol)
+
+        if not legacy_symbols:
+            marker.update({
+                "completed": True,
+                "completed_at": now_iso(),
+                "reason": "NO_LEGACY_RANGE_BASKETS",
+                "version": VERSION,
+            })
+            self.store.save()
+            self.store.set_operational_block("LEGACY_RANGE_RETIRE", None)
+            logger.info("LEGACY RANGE RETIRE | nenhum basket RANGE legado aberto")
+            return
+
+        self.store.set_operational_block(
+            "LEGACY_RANGE_RETIRE",
+            "ONE_SHOT_LEGACY_RANGE_RETIRE_IN_PROGRESS",
+        )
+        failures: List[str] = []
+        closed_symbols: List[str] = []
+
+        for symbol in legacy_symbols:
+            strategy_id = f"RANGE:{symbol}"
+            st = self.store.state.get("range", {}).get(symbol) or {}
+            basket = st.get("basket") or {}
+            legs = list(basket.get("legs") or [])
+            if not legs:
+                failures.append(f"STATE_BASKET_WITHOUT_LEGS:{symbol}")
+                continue
+
+            expected = {"LONG": D(0), "SHORT": D(0)}
+            for leg in legs:
+                side = str(leg.get("side", "")).upper()
+                if side not in expected:
+                    failures.append(f"INVALID_SIDE:{symbol}:{side}")
+                    continue
+                expected[side] += dec(leg.get("qty"))
+            if failures and failures[-1].startswith("INVALID_SIDE:"):
+                continue
+
+            # State <-> ledger ownership proof for the legacy strategy itself.
+            mismatch = False
+            for side in ("LONG", "SHORT"):
+                ledger_qty = self.ledger.open_strategy_qty(strategy_id, symbol, side)
+                step = self.rules.rules[symbol].step_size
+                if abs(ledger_qty - expected[side]) > step:
+                    failures.append(
+                        f"STATE_LEDGER_MISMATCH:{symbol}:{side}:state={expected[side]}:ledger={ledger_qty}"
+                    )
+                    mismatch = True
+            if mismatch:
+                continue
+
+            # Physical must equal total ledger ownership (legacy + any current strategy),
+            # otherwise there is unknown/manual exposure and retirement must not trade.
+            try:
+                positions = self.client.positions() if LIVE_TRADING else []
+            except Exception as exc:
+                failures.append(f"POSITION_SNAPSHOT_FAIL:{symbol}:{exc}")
+                continue
+
+            physical = {"LONG": D(0), "SHORT": D(0)}
+            marks = []
+            for p in (positions if isinstance(positions, list) else []):
+                if str(p.get("symbol", "")).upper() != symbol:
+                    continue
+                side = str(p.get("positionSide", "")).upper()
+                if side in physical:
+                    physical[side] = abs(dec(p.get("positionAmt")))
+                    mp = dec(p.get("markPrice") or p.get("entryPrice"))
+                    if mp > 0:
+                        marks.append(mp)
+
+            for side in ("LONG", "SHORT"):
+                owned = sum(self.ledger.open_strategy_breakdown(symbol, side).values(), D(0))
+                step = self.rules.rules[symbol].step_size
+                if abs(physical[side] - owned) > step:
+                    failures.append(
+                        f"PHYSICAL_LEDGER_MISMATCH:{symbol}:{side}:physical={physical[side]}:ledger={owned}"
+                    )
+                    mismatch = True
+            if mismatch:
+                continue
+
+            price = marks[0] if marks else dec(basket.get("initial_entry") or basket.get("signal_entry") or st.get("anchor"))
+            if price <= 0:
+                failures.append(f"NO_REFERENCE_PRICE:{symbol}")
+                continue
+
+            logger.warning(
+                "LEGACY RANGE RETIRE | CLOSING | symbol=%s strategy=%s | expected=%s physical=%s mark=%s",
+                symbol, strategy_id, expected, physical, dstr(price, 8),
+            )
+            try:
+                legacy_engine = RangeEngine(
+                    symbol, self.client, self.md, self.news, self.account, self.exe, self.store,
+                    state_bucket="range", state_key=symbol, grid_id="LEGACY",
+                    grid_phase=D(0), allow_new_entries=False,
+                )
+                legacy_engine._close_basket(price, "RETIRE_LEGACY_RANGE_V47", protect_after=False)
+            except Exception as exc:
+                failures.append(f"CLOSE_FAIL:{symbol}:{exc}")
+                logger.exception("LEGACY RANGE RETIRE | CLOSE FAIL | %s", symbol)
+                continue
+
+            # Post-close proof: legacy ledger must be zero and physical must be fully
+            # explained by remaining non-legacy strategies.
+            legacy_remaining = {
+                side: self.ledger.open_strategy_qty(strategy_id, symbol, side)
+                for side in ("LONG", "SHORT")
+            }
+            if any(q > 0 for q in legacy_remaining.values()):
+                failures.append(f"LEGACY_LEDGER_REMAINS:{symbol}:{legacy_remaining}")
+                continue
+            if (self.store.state.get("range", {}).get(symbol) or {}).get("basket"):
+                failures.append(f"LEGACY_STATE_BASKET_REMAINS:{symbol}")
+                continue
+
+            try:
+                fresh = self.client.positions() if LIVE_TRADING else []
+            except Exception as exc:
+                failures.append(f"POST_CLOSE_POSITION_FAIL:{symbol}:{exc}")
+                continue
+            fresh_physical = {"LONG": D(0), "SHORT": D(0)}
+            for p in (fresh if isinstance(fresh, list) else []):
+                if str(p.get("symbol", "")).upper() == symbol:
+                    side = str(p.get("positionSide", "")).upper()
+                    if side in fresh_physical:
+                        fresh_physical[side] = abs(dec(p.get("positionAmt")))
+            post_bad = False
+            for side in ("LONG", "SHORT"):
+                remaining_owned = sum(self.ledger.open_strategy_breakdown(symbol, side).values(), D(0))
+                step = self.rules.rules[symbol].step_size
+                if abs(fresh_physical[side] - remaining_owned) > step:
+                    failures.append(
+                        f"POST_CLOSE_PHYSICAL_LEDGER_MISMATCH:{symbol}:{side}:physical={fresh_physical[side]}:ledger={remaining_owned}"
+                    )
+                    post_bad = True
+            if post_bad:
+                continue
+
+            closed_symbols.append(symbol)
+            logger.warning(
+                "LEGACY RANGE RETIRE | CLOSED | symbol=%s | legacy_zero=True | remaining_physical=%s",
+                symbol, fresh_physical,
+            )
+
+        remaining_baskets = [
+            s for s in SYMBOLS
+            if (self.store.state.get("range", {}).get(s) or {}).get("basket")
+        ]
+        marker.update({
+            "completed": not remaining_baskets and not failures,
+            "last_run_at": now_iso(),
+            "version": VERSION,
+            "closed_symbols": closed_symbols,
+            "remaining_baskets": remaining_baskets,
+            "failures": failures[-20:],
+        })
+        if marker["completed"]:
+            marker["completed_at"] = now_iso()
+        self.store.save()
+
+        if marker["completed"]:
+            self.store.set_operational_block("LEGACY_RANGE_RETIRE", None)
+            logger.warning(
+                "LEGACY RANGE RETIRE | CONCLUIDO | baskets legados encerrados=%s | somente G0-G3 + MACD permanecem",
+                closed_symbols,
+            )
+        else:
+            reason = f"LEGACY_RANGE_RETIRE_INCOMPLETE remaining={remaining_baskets} failures={failures[-5:]}"
+            self.store.set_operational_block("LEGACY_RANGE_RETIRE", reason)
+            logger.error("LEGACY RANGE RETIRE | INCOMPLETO | novas entradas bloqueadas | %s", reason)
+
     def retire_legacy_pyramid_positions(self) -> None:
         """Fecha somente lots persistentes PYRAMID:* que sobraram do robô antigo.
 
@@ -4453,6 +4650,7 @@ class Bot:
         logger.info(f"HARDENING | state_backup={STATE_BACKUP_FILE} | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
         logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD}")
         logger.info(f"LEGACY PYRAMID RETIRE | enabled={RETIRE_LEGACY_PYRAMID_ON_STARTUP} | mode=LEDGER_OWNED_ONLY")
+        logger.info(f"LEGACY RANGE RETIRE | enabled={RETIRE_LEGACY_RANGE_ON_STARTUP} | mode=ONE_SHOT_LEDGER_OWNED_ONLY")
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -4477,6 +4675,8 @@ class Bot:
                 self.emergency_close_all_and_reset()
             if RETIRE_LEGACY_PYRAMID_ON_STARTUP:
                 self.retire_legacy_pyramid_positions()
+            if RETIRE_LEGACY_RANGE_ON_STARTUP:
+                self.retire_legacy_range_positions()
             self.reconciler.reconcile()
         else:
             logger.warning("MODO SIMULACAO: nenhuma ordem real sera enviada")
