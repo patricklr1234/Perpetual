@@ -108,8 +108,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.5.0-v19-local-range-subgrids"
-BOT_NAME = "ASTER_PERPETUAL_BOT_V19_LOCAL_SUBGRIDS"
+VERSION = "5.7.0-v21-retire-legacy-pyramid"
+BOT_NAME = "ASTER_PERPETUAL_BOT_V21_RETIRE_LEGACY_PYRAMID"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -118,6 +118,7 @@ SIGNER_PRIVATE_KEY = os.getenv("ASTER_API_WALLET_PRIVATE_KEY", "").strip()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
 VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
+RETIRE_LEGACY_PYRAMID_ON_STARTUP = os.getenv("RETIRE_LEGACY_PYRAMID_ON_STARTUP", "1") == "1"
 EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1332,6 +1333,53 @@ class FillLedger:
             row = self.db.execute("SELECT COALESCE(SUM(CAST(open_qty AS REAL)),0) FROM lots WHERE strategy_id=? AND symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
                                   (strategy_id, symbol, side)).fetchone()
         return dec(row[0] if row else 0)
+
+    def open_strategy_breakdown(self, symbol: str, side: str) -> Dict[str, Decimal]:
+        """Retorna ownership persistente do FillLedger para symbol/positionSide."""
+        out: Dict[str, Decimal] = {}
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT strategy_id, COALESCE(SUM(CAST(open_qty AS REAL)),0)
+                FROM lots
+                WHERE symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0
+                GROUP BY strategy_id
+                """,
+                (str(symbol).upper(), str(side).upper()),
+            ).fetchall()
+        for strategy_id, raw_qty in rows:
+            qty = dec(raw_qty)
+            if qty > 0:
+                out[str(strategy_id)] = qty
+        return out
+
+    def open_lots_by_strategy_prefix(self, prefix: str) -> List[Dict[str, Any]]:
+        """Lots ainda abertos cujo strategy_id começa com prefix."""
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT leg_id,strategy_id,symbol,position_side,open_qty,entry_price,source
+                FROM lots
+                WHERE strategy_id LIKE ? AND CAST(open_qty AS REAL)>0
+                ORDER BY opened_ms ASC, leg_id ASC
+                """,
+                (str(prefix) + "%",),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for leg_id, strategy_id, symbol, side, open_qty, entry_price, source in rows:
+            qty = dec(open_qty)
+            if qty <= 0:
+                continue
+            out.append({
+                "id": str(leg_id),
+                "strategy_id": str(strategy_id),
+                "symbol": str(symbol).upper(),
+                "side": str(side).upper(),
+                "qty": str(qty),
+                "entry_price": str(dec(entry_price)),
+                "source": str(source or "BOT"),
+            })
+        return out
 
     def zero_open_lots_for_symbol(self, symbol: str, reason: str = "EXCHANGE_ZERO_RECONCILE") -> int:
         """Close only ledger lots for a symbol after exchange confirms BOTH hedge sides are zero."""
@@ -3271,7 +3319,7 @@ def run_internal_regression_checks() -> None:
     anchors = [p * (D(1) + phase) for phase in RANGE_GRID_PHASES]
     assert anchors == [D("100"), D("100.2500"), D("100.500"), D("100.7500")]
     assert len(set(anchors)) == 4
-    logger.info("SELF TEST V19 | PASS | range-subgrids/ledger/recovery/risk/tick/native-stop/bankroll-separation invariants")
+    logger.info("SELF TEST V21 | PASS | range-subgrids/ledger/recovery/risk/tick/native-stop/bankroll-separation/legacy-pyramid-retire invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -3378,6 +3426,155 @@ class Bot:
         for symbol in SYMBOLS:
             self._migrate_legacy_range_to_grids_if_flat(symbol)
 
+    def retire_legacy_pyramid_positions(self) -> None:
+        """Fecha somente lots persistentes PYRAMID:* que sobraram do robô antigo.
+
+        O Principal V21 não possui PyramidEngine. O ledger é usado como prova de
+        ownership para que nenhuma quantidade RANGE/MACD seja fechada por engano.
+        """
+        if not RETIRE_LEGACY_PYRAMID_ON_STARTUP:
+            logger.warning("LEGACY PYRAMID RETIRE V21 | DESABILITADO por configuracao")
+            return
+
+        maintenance = self.store.state.setdefault("maintenance", {})
+        marker = maintenance.setdefault("legacy_pyramid_retirement", {})
+        lots = self.ledger.open_lots_by_strategy_prefix("PYRAMID:")
+
+        if not lots:
+            if not marker.get("completed"):
+                marker.update({
+                    "completed": True,
+                    "completed_at": now_iso(),
+                    "reason": "NO_OPEN_PYRAMID_LEDGER_LOTS",
+                })
+                self.store.save()
+            logger.info("LEGACY PYRAMID RETIRE V21 | nenhum lot PYRAMID aberto no ledger")
+            return
+
+        logger.warning(
+            "LEGACY PYRAMID RETIRE V21 | encontrados=%s lots | action=CLOSE_LEDGER_OWNED_ONLY",
+            len(lots),
+        )
+
+        failures: List[str] = []
+        for lot in lots:
+            strategy_id = str(lot["strategy_id"])
+            symbol = str(lot["symbol"]).upper()
+            side = str(lot["side"]).upper()
+            qty = dec(lot["qty"])
+
+            if symbol not in SYMBOLS or side not in ("LONG", "SHORT") or qty <= 0:
+                failures.append(f"INVALID_LOT:{strategy_id}:{symbol}:{side}:{qty}")
+                continue
+
+            # Re-read physical position immediately before every close.
+            positions = self.client.positions() if LIVE_TRADING else []
+            physical_qty = D(0)
+            mark = dec(lot.get("entry_price"))
+            for p in (positions if isinstance(positions, list) else []):
+                if str(p.get("symbol", "")).upper() == symbol and str(p.get("positionSide", "")).upper() == side:
+                    physical_qty = abs(dec(p.get("positionAmt")))
+                    mark = dec(p.get("markPrice") or p.get("entryPrice") or mark)
+                    break
+
+            if LIVE_TRADING and physical_qty <= 0:
+                # Physical already gone: reconcile this specific ledger lot without
+                # sending a duplicate order.
+                self.ledger.record_close_lot(str(lot["id"]), qty)
+                logger.warning(
+                    "LEGACY PYRAMID RETIRE V21 | physical already flat | strategy=%s symbol=%s side=%s qty=%s "
+                    "| ledger lot marcado fechado sem nova ordem",
+                    strategy_id, symbol, side, dstr(qty, 8),
+                )
+                continue
+
+            close_qty = qty if not LIVE_TRADING else min(qty, physical_qty)
+            step = self.rules.rules[symbol].step_size
+            close_qty = floor_step(close_qty, step)
+            if close_qty <= 0:
+                failures.append(
+                    f"NO_CLOSABLE_QTY:{strategy_id}:{symbol}:{side}:ledger={qty}:physical={physical_qty}"
+                )
+                continue
+
+            # Construct only the fields required by close_leg/_close_record.
+            leg = {
+                "id": str(lot["id"]),
+                "side": side,
+                "qty": str(close_qty),
+                "entry_price": str(dec(lot["entry_price"])),
+            }
+
+            logger.warning(
+                "LEGACY PYRAMID RETIRE V21 | CLOSING | strategy=%s symbol=%s side=%s "
+                "| ledger_qty=%s physical_qty=%s close_qty=%s mark=%s",
+                strategy_id, symbol, side, dstr(qty, 8), dstr(physical_qty, 8),
+                dstr(close_qty, 8), dstr(mark, 8),
+            )
+
+            try:
+                rec = self.exe.close_leg(
+                    strategy_id,
+                    symbol,
+                    leg,
+                    mark,
+                    "RETIRE_LEGACY_PYRAMID_V21",
+                    max_physical_qty=close_qty,
+                )
+                if rec is None:
+                    failures.append(f"CLOSE_SKIPPED:{strategy_id}:{symbol}:{side}:{close_qty}")
+                    continue
+                logger.warning(
+                    "LEGACY PYRAMID RETIRE V21 | CLOSED | strategy=%s symbol=%s side=%s qty=%s "
+                    "| entry=%s exit=%s pnl_est=%s exchange_realized=%s",
+                    strategy_id, symbol, side, rec.get("qty"), rec.get("entry_price"),
+                    rec.get("exit_price"), rec.get("pnl_est"), rec.get("exchange_realized_pnl"),
+                )
+            except Exception as exc:
+                failures.append(f"CLOSE_FAIL:{strategy_id}:{symbol}:{side}:{exc}")
+                logger.exception(
+                    "LEGACY PYRAMID RETIRE V21 | CLOSE FAIL | strategy=%s symbol=%s side=%s qty=%s",
+                    strategy_id, symbol, side, dstr(close_qty, 8),
+                )
+
+        remaining = self.ledger.open_lots_by_strategy_prefix("PYRAMID:")
+        marker.update({
+            "completed": not bool(remaining) and not bool(failures),
+            "last_run_at": now_iso(),
+            "remaining_open_lots": [
+                {
+                    "strategy_id": x["strategy_id"],
+                    "symbol": x["symbol"],
+                    "side": x["side"],
+                    "qty": x["qty"],
+                }
+                for x in remaining
+            ],
+            "failures": failures[-20:],
+        })
+        if marker["completed"]:
+            marker["completed_at"] = now_iso()
+            # Old strategy state is no longer executable in Principal; keep only
+            # retirement metadata. Ledger/trades retain the durable audit trail.
+            if "pyramid" in self.store.state:
+                self.store.state["pyramid"] = {}
+            if "pyramid_grids" in self.store.state:
+                self.store.state["pyramid_grids"] = {}
+        self.store.save()
+
+        if remaining or failures:
+            reason = f"LEGACY_PYRAMID_RETIRE_INCOMPLETE remaining={remaining} failures={failures[-5:]}"
+            self.store.set_trade_gate(False, reason)
+            logger.error(
+                "LEGACY PYRAMID RETIRE V21 | INCOMPLETO | novas entradas bloqueadas | %s",
+                reason,
+            )
+        else:
+            logger.warning(
+                "LEGACY PYRAMID RETIRE V21 | CONCLUIDO | todos os lots PYRAMID legados encerrados; "
+                "Principal segue somente RANGE+MACD"
+            )
+
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
@@ -3393,6 +3590,7 @@ class Bot:
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"V15 HARDENING | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
         logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD}")
+        logger.info(f"LEGACY PYRAMID RETIRE V21 | enabled={RETIRE_LEGACY_PYRAMID_ON_STARTUP} | mode=LEDGER_OWNED_ONLY")
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -3415,6 +3613,8 @@ class Bot:
                 self.ledger.bootstrap_from_state(self.store)
             if EMERGENCY_CLOSE_ALL_AND_RESET:
                 self.emergency_close_all_and_reset()
+            if RETIRE_LEGACY_PYRAMID_ON_STARTUP:
+                self.retire_legacy_pyramid_positions()
             self.reconciler.reconcile()
         else:
             logger.warning("MODO SIMULACAO: nenhuma ordem real sera enviada")
@@ -3693,6 +3893,9 @@ class Bot:
             tol = max(D("0.00000001"), step)
             residual = qty - virtual_qty
 
+            ledger_owners = self.ledger.open_strategy_breakdown(symbol, side)
+            ledger_qty = sum(ledger_owners.values(), D(0))
+
             if candidates:
                 names = [str(x["strategy"]) for x in candidates]
                 unique_names = list(dict.fromkeys(names))
@@ -3704,7 +3907,21 @@ class Bot:
                     owner += f"+RESIDUO_EXTERNO({dstr(residual, 8)})"
             else:
                 legacy = legacy_owners.get(symbol) if not ALLOW_MULTI_STRATEGY_SAME_SYMBOL else None
-                owner = legacy or "DESCONHECIDO/EXTERNO"
+                if ledger_owners:
+                    ledger_names = list(ledger_owners.keys())
+                    if len(ledger_names) == 1:
+                        strategy_id = ledger_names[0]
+                        if strategy_id.startswith("PYRAMID:"):
+                            owner = strategy_id + "+LEGADO_FORA_DO_MOTOR_PRINCIPAL"
+                        else:
+                            owner = strategy_id + "+OWNER_LEDGER"
+                    else:
+                        owner = "AGREGADA_LEDGER[" + ",".join(ledger_names) + "]"
+                    ledger_residual = qty - ledger_qty
+                    if abs(ledger_residual) > tol:
+                        owner += f"+RESIDUO_EXTERNO({dstr(ledger_residual, 8)})"
+                else:
+                    owner = legacy or "DESCONHECIDO/EXTERNO"
 
             entry = dec(p.get("entryPrice"))
             mark = dec(p.get("markPrice"))
@@ -3749,6 +3966,18 @@ class Bot:
                 )
             virtual_lots = ";".join(virtual_lot_parts) or "-"
 
+            if not candidates and ledger_owners:
+                for ledger_strategy, ledger_strategy_qty in ledger_owners.items():
+                    if str(ledger_strategy).startswith("PYRAMID:"):
+                        logger.warning(
+                            "LEGACY PYRAMID ATTRIBUTION V21 | strategy=%s | symbol=%s side=%s "
+                            "| qty=%s | status=OWNERSHIP_RECOGNIZED_NO_NEW_PYRAMID_ENTRIES",
+                            ledger_strategy,
+                            symbol,
+                            side,
+                            dstr(ledger_strategy_qty, 8),
+                        )
+
             def remaining_pct(raw: Any) -> str:
                 try:
                     level = dec(raw)
@@ -3770,7 +3999,8 @@ class Bot:
                 pass
 
             logger.warning(
-                f"OPEN POSITION | strategy={owner} | symbol={symbol} side={side} qty={qty} virtual_qty={virtual_qty} residual={dstr(residual, 8)} | "
+                f"OPEN POSITION | strategy={owner} | symbol={symbol} side={side} qty={qty} virtual_qty={virtual_qty} residual={dstr(residual, 8)} "
+                f"| ledger_qty={dstr(ledger_qty, 8)} ledger_owners={ledger_owners or '-'} | "
                 f"entry={entry} mark={mark} move_favoravel={dstr(favorable * D(100), 6)}% | notional_usd={notional} margin_isolada={margin} leverage={leverage}x unreal_pnl={unreal} | "
                 f"tp={target} distancia_tp={tp_distance}% | stop={stop} distancia_stop={stop_distance}% | "
                 f"liq={liq} distancia_liq={liq_distance}% buffer_stop_liq={stop_liq_buffer}% | recovery_level={recovery_level} | virtual_lots={virtual_lots}"
