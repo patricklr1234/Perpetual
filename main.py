@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.34.0-v49-inherited-protect-reset"
+VERSION = "5.35.0-v50-inherited-protect-reset-fix"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -4359,7 +4359,7 @@ class Bot:
 
         target_symbols = sorted({sym for sym, _key in candidates})
         for symbol in target_symbols:
-            step = self.rules.step(symbol)
+            step = self.rules.rules[symbol].step_size
             for side in ("LONG", "SHORT"):
                 if physical.get((symbol, side), D(0)) > max(step, D("0.00000001")):
                     reason = f"PHYSICAL_NOT_FLAT:{symbol}:{side}:{physical.get((symbol, side), D(0))}"
