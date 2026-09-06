@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.36.0-v51-inherited-macd-protect-reset"
+VERSION = "5.37.0-v52-full-factory-reset"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -110,11 +110,13 @@ SIGNER_PRIVATE_KEY = os.getenv("ASTER_API_WALLET_PRIVATE_KEY", "").strip()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
 VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
+FULL_FACTORY_RESET_ON_STARTUP = os.getenv("FULL_FACTORY_RESET_ON_STARTUP", "1") == "1"
 RETIRE_LEGACY_PYRAMID_ON_STARTUP = os.getenv("RETIRE_LEGACY_PYRAMID_ON_STARTUP", "1") == "1"
 RETIRE_LEGACY_RANGE_ON_STARTUP = os.getenv("RETIRE_LEGACY_RANGE_ON_STARTUP", "1") == "1"
 RESET_INHERITED_RANGE_PROTECT_ON_STARTUP = os.getenv("RESET_INHERITED_RANGE_PROTECT_ON_STARTUP", "1") == "1"
 RESET_INHERITED_MACD_PROTECT_ON_STARTUP = os.getenv("RESET_INHERITED_MACD_PROTECT_ON_STARTUP", "1") == "1"
 EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
+FULL_FACTORY_RESET_ID = os.getenv("FULL_FACTORY_RESET_ID", "principal-full-reset-v52-20260906").strip()
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = BOT_DIR / "state.json"
@@ -4904,6 +4906,7 @@ class Bot:
         logger.info(f"LEGACY RANGE RETIRE | enabled={RETIRE_LEGACY_RANGE_ON_STARTUP} | mode=ONE_SHOT_LEDGER_OWNED_ONLY")
         logger.info(f"INHERITED RANGE PROTECT RESET | enabled={RESET_INHERITED_RANGE_PROTECT_ON_STARTUP} | mode=ONE_SHOT_STATE_ONLY_ACCOUNTING_PRESERVED")
         logger.info(f"INHERITED MACD PROTECT RESET | enabled={RESET_INHERITED_MACD_PROTECT_ON_STARTUP} | mode=ONE_SHOT_STATE_ONLY_ACCOUNTING_PRESERVED")
+        logger.info(f"FULL FACTORY RESET | enabled={FULL_FACTORY_RESET_ON_STARTUP} | id={FULL_FACTORY_RESET_ID} | mode=ONE_SHOT_ACCOUNT_WIDE_CLOSE_AND_HISTORY_RESET")
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -4924,7 +4927,9 @@ class Bot:
             self.account.sync(force=True)
             if LEDGER_RECONCILE_ON_STARTUP:
                 self.ledger.bootstrap_from_state(self.store)
-            if EMERGENCY_CLOSE_ALL_AND_RESET:
+            if FULL_FACTORY_RESET_ON_STARTUP:
+                self.full_factory_reset_all_and_start_fresh()
+            elif EMERGENCY_CLOSE_ALL_AND_RESET:
                 self.emergency_close_all_and_reset()
             if RETIRE_LEGACY_PYRAMID_ON_STARTUP:
                 self.retire_legacy_pyramid_positions()
@@ -4961,6 +4966,157 @@ class Bot:
             self.macd_engines = [MacdEngine(s, tf, self.client, self.md, self.news, self.account, self.exe, self.store)
                                  for s in SYMBOLS for tf in MACD_TIMEFRAMES]
         self.md.start(); self.news.start()
+
+    def full_factory_reset_all_and_start_fresh(self) -> None:
+        """One-shot account-wide reset requested for V52.
+
+        Intentionally closes *all* account positions and cancels *all* account orders,
+        including exposure not owned by the bot. It proceeds only after the exchange
+        proves zero remaining positions and zero remaining open orders. Then it resets
+        all RANGE/MACD accounting/history artifacts and writes the same fresh state to
+        both primary and backup so historical strategy state cannot be restored later.
+        """
+        maintenance = self.store.state.setdefault("maintenance", {"completed_emergency_actions": []})
+        completed = maintenance.setdefault("completed_factory_resets", [])
+        completed_ids = {
+            str(x.get("id")) if isinstance(x, dict) else str(x)
+            for x in completed
+        }
+        if FULL_FACTORY_RESET_ID in completed_ids:
+            logger.warning(
+                "FULL FACTORY RESET | id=%s ja concluido; nenhuma ordem/posicao sera repetida",
+                FULL_FACTORY_RESET_ID,
+            )
+            return
+
+        self.store.set_operational_block(
+            "FULL_FACTORY_RESET",
+            f"ONE_SHOT_ACCOUNT_WIDE_RESET:{FULL_FACTORY_RESET_ID}",
+        )
+        logger.critical(
+            "FULL FACTORY RESET | INICIO | id=%s | cancelando TODAS as ordens e fechando TODAS as posicoes da conta",
+            FULL_FACTORY_RESET_ID,
+        )
+
+        open_orders = self.client.open_orders()
+        positions = self.client.positions()
+        symbols = {
+            str(x.get("symbol", "")).upper()
+            for x in (open_orders if isinstance(open_orders, list) else [])
+            if x.get("symbol")
+        }
+        symbols.update(
+            str(x.get("symbol", "")).upper()
+            for x in (positions if isinstance(positions, list) else [])
+            if x.get("symbol") and abs(dec(x.get("positionAmt"))) > 0
+        )
+
+        for symbol in sorted(symbols):
+            if not self.client.cancel_all_confirmed(symbol):
+                raise RuntimeError(f"FULL FACTORY RESET | cancelamento NAO confirmado | {symbol}")
+            logger.warning("FULL FACTORY RESET | ordens canceladas e confirmadas | %s", symbol)
+
+        for p in (positions if isinstance(positions, list) else []):
+            qty = abs(dec(p.get("positionAmt")))
+            if qty <= 0:
+                continue
+            symbol = str(p.get("symbol", "")).upper()
+            position_side = str(p.get("positionSide", "")).upper()
+            if position_side not in ("LONG", "SHORT"):
+                raise RuntimeError(f"FULL FACTORY RESET encontrou positionSide invalido: {p}")
+            mark = dec(p.get("markPrice") or p.get("entryPrice") or 0)
+            if mark <= 0:
+                raise RuntimeError(f"FULL FACTORY RESET sem preco valido para fechar {symbol} {position_side}")
+            logger.critical(
+                "FULL FACTORY CLOSE | symbol=%s side=%s qty=%s entry=%s mark=%s notional=%s unreal=%s",
+                symbol, position_side, qty, p.get("entryPrice"), p.get("markPrice"),
+                abs(dec(p.get("notional") or qty * mark)),
+                p.get("unRealizedProfit") or p.get("unrealizedProfit"),
+            )
+            self.exe.market("FULL_FACTORY_RESET", symbol, position_side, qty, False, mark)
+
+        remaining_positions = []
+        remaining_orders = []
+        for _ in range(8):
+            time.sleep(1)
+            remaining_positions = [
+                p for p in self.client.positions()
+                if abs(dec(p.get("positionAmt"))) > 0
+            ]
+            remaining_orders = self.client.open_orders()
+            if not isinstance(remaining_orders, list):
+                remaining_orders = [remaining_orders] if remaining_orders else []
+            if not remaining_positions and not remaining_orders:
+                break
+            # Orders can appear transiently while closes settle; cancel them again and prove zero.
+            residual_symbols = {
+                str(x.get("symbol", "")).upper()
+                for x in remaining_orders
+                if isinstance(x, dict) and x.get("symbol")
+            }
+            for symbol in sorted(residual_symbols):
+                self.client.cancel_all_confirmed(symbol)
+
+        if remaining_positions or remaining_orders:
+            raise RuntimeError(
+                "FULL FACTORY RESET NAO CONFIRMADO | posicoes_restantes="
+                + str([(p.get("symbol"), p.get("positionSide"), p.get("positionAmt")) for p in remaining_positions])
+                + " | ordens_restantes="
+                + str([(o.get("symbol"), o.get("orderId"), o.get("clientOrderId")) for o in remaining_orders if isinstance(o, dict)])
+            )
+
+        reset = fresh_state()
+        reset["maintenance"]["completed_factory_resets"] = [{
+            "id": FULL_FACTORY_RESET_ID,
+            "completed_at": now_iso(),
+            "action": "ACCOUNT_WIDE_CLOSE_CANCEL_AND_FULL_HISTORY_RESET",
+            "version": VERSION,
+        }]
+        reset["maintenance"]["completed_emergency_actions"] = []
+
+        # Replace primary state and force backup to the same fresh image. StateStore.save()
+        # normally preserves the prior generation in backup; that behavior is intentionally
+        # overridden here because this operation explicitly erases pre-V52 strategy history.
+        with self.store.lock:
+            self.store.state = reset
+            self.store.save()
+            atomic_json_write(STATE_BACKUP_FILE, reset)
+
+        # Clear durable execution/accounting history only after exchange-flat proof.
+        self.ledger.reset()
+        try:
+            with self.ledger.lock:
+                self.ledger.db.execute("VACUUM")
+                self.ledger.db.commit()
+        except Exception as e:
+            logger.warning("FULL FACTORY RESET | SQLite VACUUM nao concluido | %s", e)
+
+        for history_file in (TRADES_FILE, ORDER_JOURNAL_FILE):
+            try:
+                history_file.write_text("", encoding="utf-8")
+            except Exception as e:
+                raise RuntimeError(f"FULL FACTORY RESET falhou ao limpar {history_file}: {e}") from e
+
+        self.account.sync(force=True)
+        # Final authenticated proof after all local resets.
+        final_positions = [
+            p for p in self.client.positions()
+            if abs(dec(p.get("positionAmt"))) > 0
+        ]
+        final_orders = self.client.open_orders()
+        if not isinstance(final_orders, list):
+            final_orders = [final_orders] if final_orders else []
+        if final_positions or final_orders:
+            raise RuntimeError(
+                "FULL FACTORY RESET | PROVA FINAL FALHOU | positions="
+                + str([(p.get("symbol"), p.get("positionSide"), p.get("positionAmt")) for p in final_positions])
+                + " orders=" + str([(o.get("symbol"), o.get("orderId")) for o in final_orders if isinstance(o, dict)])
+            )
+
+        logger.critical(
+            "FULL FACTORY RESET | CONCLUIDO | id=%s | positions=0 orders=0 | state+backup novos | ledger/trades/order_journal zerados | RANGE+MACD reiniciados nos bankrolls-base",
+            FULL_FACTORY_RESET_ID,
+        )
 
     def emergency_close_all_and_reset(self) -> None:
         maintenance = self.store.state.setdefault("maintenance", {"completed_emergency_actions": []})
