@@ -33,6 +33,10 @@ Risco e execução:
   - Proteções nativas são verificadas em modo fail-closed.
   - Se uma nova posição RANGE/MACD não puder receber a proteção obrigatória,
     a exposição recém-aberta é encerrada.
+  - Recovery RANGE faz preflight de sizing antes de cancelar proteções existentes.
+  - Overshoot de notional inicial só é aceito quando for imposto pelo lote/notional
+    mínimo da exchange e continuar dentro dos limites lógicos de risco/margem.
+  - FULL FACTORY RESET é opt-in em produção (default OFF).
 
 Sizing:
   - Bankroll é contabilidade lógica de risco, não reserva física de caixa.
@@ -100,7 +104,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.41.0-v56-fee-model-observability-fix"
+VERSION = "5.42.0-v57-safety-recovery-minlot-fix"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -110,7 +114,7 @@ SIGNER_PRIVATE_KEY = os.getenv("ASTER_API_WALLET_PRIVATE_KEY", "").strip()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
 VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
-FULL_FACTORY_RESET_ON_STARTUP = os.getenv("FULL_FACTORY_RESET_ON_STARTUP", "1") == "1"
+FULL_FACTORY_RESET_ON_STARTUP = os.getenv("FULL_FACTORY_RESET_ON_STARTUP", "0") == "1"
 RETIRE_LEGACY_PYRAMID_ON_STARTUP = os.getenv("RETIRE_LEGACY_PYRAMID_ON_STARTUP", "1") == "1"
 RETIRE_LEGACY_RANGE_ON_STARTUP = os.getenv("RETIRE_LEGACY_RANGE_ON_STARTUP", "1") == "1"
 RESET_INHERITED_RANGE_PROTECT_ON_STARTUP = os.getenv("RESET_INHERITED_RANGE_PROTECT_ON_STARTUP", "1") == "1"
@@ -141,6 +145,7 @@ INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv(
 ))
 BTC_INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv("BTC_INITIAL_OPERATION_NOTIONAL_USD", "100"))
 MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT = D(os.getenv("MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT", "0.05"))
+MAX_MIN_LOT_OVERSHOOT_MULTIPLIER = D(os.getenv("MAX_MIN_LOT_OVERSHOOT_MULTIPLIER", "2.0"))
 RECOVERY_MULTIPLIER = D(os.getenv("RECOVERY_MULTIPLIER", "4"))
 MACD_RECOVERY_MULTIPLIER = D(os.getenv("MACD_RECOVERY_MULTIPLIER", "2"))
 MAX_RECOVERY_FAILURES = int(os.getenv("MAX_RECOVERY_FAILURES", "2"))
@@ -255,6 +260,7 @@ def validate_runtime_config() -> None:
     require(ADVERSE_MOVE_SAFETY_MULTIPLIER >= D(1), f"ADVERSE_MOVE_SAFETY_MULTIPLIER deve ser >=1, atual={ADVERSE_MOVE_SAFETY_MULTIPLIER}")
     require(MIN_FREE_WALLET_BUFFER_USD >= D(0), f"MIN_FREE_WALLET_BUFFER_USD nao pode ser negativo: {MIN_FREE_WALLET_BUFFER_USD}")
     require(D(0) < MAX_MARGIN_FRACTION_PER_STRATEGY <= D(1), f"MAX_MARGIN_FRACTION_PER_STRATEGY deve estar em (0,1], atual={MAX_MARGIN_FRACTION_PER_STRATEGY}")
+    require(MAX_MIN_LOT_OVERSHOOT_MULTIPLIER >= D(1), f"MAX_MIN_LOT_OVERSHOOT_MULTIPLIER deve ser >=1, atual={MAX_MIN_LOT_OVERSHOOT_MULTIPLIER}")
 
     for name, value in (("INITIAL_BANKROLL_USD", INITIAL_BANKROLL_USD), ("BTC_INITIAL_BANKROLL_USD", BTC_INITIAL_BANKROLL_USD),
                         ("INITIAL_OPERATION_NOTIONAL_USD", INITIAL_OPERATION_NOTIONAL_USD), ("BTC_INITIAL_OPERATION_NOTIONAL_USD", BTC_INITIAL_OPERATION_NOTIONAL_USD),
@@ -2106,11 +2112,31 @@ class AccountManager:
             max_allowed = desired_notional * (D(1) + MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT)
             if actual_notional > max_allowed:
                 rule = self.rules.rules[symbol]
-                logger.warning(
-                    f"SIZING BLOCK | {symbol} | entrada_inicial={desired_notional} notional_minimo_real={actual_notional} "
-                    f"limite_com_tolerancia={max_allowed} min_qty={rule.min_qty} step={rule.step_size} price={price}"
+                min_exec_qty = self.rules.qty(symbol, D(0), price)
+                min_exec_notional = min_exec_qty * price
+                forced_by_exchange_minimum = (
+                    qty == min_exec_qty
+                    and actual_notional == min_exec_notional
+                    and actual_notional <= desired_notional * MAX_MIN_LOT_OVERSHOOT_MULTIPLIER
                 )
-                return None
+                if forced_by_exchange_minimum:
+                    logger.warning(
+                        f"SIZING MIN-LOT ADAPT | {symbol} | desejado={desired_notional} executavel_minimo={actual_notional} "
+                        f"overshoot_cap={MAX_MIN_LOT_OVERSHOOT_MULTIPLIER}x min_qty={rule.min_qty} "
+                        f"min_notional={rule.min_notional} step={rule.step_size} price={price}"
+                    )
+                else:
+                    logger.warning(
+                        f"SIZING BLOCK | {symbol} | entrada_inicial={desired_notional} notional_minimo_real={actual_notional} "
+                        f"limite_com_tolerancia={max_allowed} min_qty={rule.min_qty} step={rule.step_size} price={price}"
+                    )
+                    return None
+        if actual_margin > base_budget:
+            logger.warning(
+                f"SIZING LOGICAL MARGIN BLOCK | {symbol} | margin_necessaria={actual_margin} "
+                f"orcamento_logico={base_budget} notional={actual_notional} lev={lev}x level={recovery_level}"
+            )
+            return None
         if estimated_adverse_loss > logical_eq * MAX_MARGIN_FRACTION_PER_STRATEGY:
             logger.warning(
                 f"SIZING RISK BLOCK | {symbol} | notional={actual_notional} perda_estimada_stop={estimated_adverse_loss} caixa_logico={logical_eq} level={recovery_level}"
@@ -3436,26 +3462,79 @@ class RangeEngine:
         if target <= 0:
             target = None
         recovery_level = min(int(b.get("alternations", 0)) + 1, MAX_RECOVERY_FAILURES)
+        desired_notional, recovery_tp_signal, existing_at_tp = self.dynamic_recovery_notional(
+            st, b, new_side, price, recovery_level
+        )
+
+        # V57: prove the next recovery leg fits BEFORE touching the native TP/SL
+        # already protecting the current basket. V56 canceled them first; when level-2
+        # sizing was impossible, the next loop had to recreate them, causing churn and
+        # a short avoidable protection gap.
+        preflight = self.account.sizing_for_profit_target(
+            self.symbol, price, st, target, RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
+            recovery_level=recovery_level,
+            desired_notional_override=desired_notional,
+            recovery_multiplier=RECOVERY_MULTIPLIER,
+        )
+        if not preflight:
+            block_sig = f"{recovery_level}:{desired_notional}"
+            if str(b.get("last_reverse_preflight_block") or "") != block_sig:
+                b["last_reverse_preflight_block"] = block_sig
+                st["last_update"] = now_iso()
+                self.store.save()
+                logger.warning(
+                    f"RANGE REVERSE PREFLIGHT BLOCK | {self.symbol} grid={self.grid_id} | "
+                    f"level={recovery_level} desired_notional={desired_notional} | "
+                    "protecoes_existentes_preservadas=True"
+                )
+            return
+        b["last_reverse_preflight_block"] = None
+
         self.exe.cancel_bracket(self.symbol, b.get("native_bracket"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
         b["native_bracket"] = None
         b["native_basket_exit"] = None
         b["native_basket_stop"] = None
-        desired_notional, recovery_tp_signal, existing_at_tp = self.dynamic_recovery_notional(
-            st, b, new_side, price, recovery_level
-        )
         leg = self._open(new_side, price, target, "RANGE_ALTERNATING_RECOVERY",
                          recovery_level=recovery_level,
                          desired_notional_override=desired_notional)
         if not leg:
-            if len(b.get("legs", [])) == 1:
-                original_leg = b["legs"][0]
-                b["native_bracket"] = self.exe.install_bracket(
-                    self.id, self.symbol, original_leg,
-                    dec(b.get("tp_price")), dec(b.get("hard_stop_price")),
-                )
+            # Race after preflight: restore the previous protection in the same tick.
+            try:
+                if len(b.get("legs", [])) == 1:
+                    original_leg = b["legs"][0]
+                    b["native_bracket"] = self.exe.install_bracket(
+                        self.id, self.symbol, original_leg,
+                        dec(b.get("tp_price")), dec(b.get("hard_stop_price")),
+                    )
+                else:
+                    old_rtp = dec(b.get("recovery_tp_price"))
+                    old_rsl = dec(b.get("recovery_stop_price"))
+                    if old_rtp <= 0 or old_rsl <= 0:
+                        raise RuntimeError("recovery basket sem TP/SL persistidos para restauracao")
+                    b["native_basket_exit"] = self.exe.install_basket_exit(
+                        self.id + ":TP", self.symbol, b.get("legs", []), old_rtp, price
+                    )
+                    b["native_basket_stop"] = self.exe.install_basket_exit(
+                        self.id + ":SL", self.symbol, b.get("legs", []), old_rsl, price
+                    )
+                self.store.set_protection_block(self.id, None)
+                st["last_update"] = now_iso()
                 self.store.save()
+                logger.warning(
+                    f"RANGE REVERSE ABORT RESTORE | {self.symbol} grid={self.grid_id} | "
+                    "nova_perna_nao_aberta; protecao_anterior_restaurada=True"
+                )
+            except Exception as restore_error:
+                self.store.set_protection_block(self.id, f"RANGE_REVERSE_RESTORE_FAILED:{restore_error}")
+                st["last_update"] = now_iso()
+                self.store.save()
+                logger.critical(
+                    "RANGE REVERSE RESTORE FAIL | %s grid=%s | %s",
+                    self.symbol, self.grid_id, restore_error,
+                )
+                self._close_basket(price, "RANGE_REVERSE_RESTORE_FAILED", protect_after=True)
             return
         recovery_entry = dec(leg["entry_price"])
         recovery_tp = recovery_entry * (D(1) + RANGE_TAKE_PROFIT_PCT) \
@@ -4467,6 +4546,8 @@ def run_internal_regression_checks() -> None:
     assert RANGE_GRID_PHASES == (D("0"), D("0.0025"), D("0.005"), D("0.0075"))
     assert RANGE_GRID_COUNT == 4
     assert RANGE_GRID_BANKROLL_USD > 0 and BTC_RANGE_GRID_BANKROLL_USD > 0
+    assert MAX_MIN_LOT_OVERSHOOT_MULTIPLIER >= D(1)
+    assert FULL_FACTORY_RESET_ON_STARTUP in (True, False)
     p = D("100")
     anchors = [p * (D(1) + phase) for phase in RANGE_GRID_PHASES]
     assert anchors == [D("100"), D("100.2500"), D("100.500"), D("100.7500")]
@@ -5259,7 +5340,7 @@ class Bot:
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"HARDENING | state_backup={STATE_BACKUP_FILE} | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
-        logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD}")
+        logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD} | min_lot_overshoot_cap={MAX_MIN_LOT_OVERSHOOT_MULTIPLIER}x")
         logger.info(f"LEGACY PYRAMID RETIRE | enabled={RETIRE_LEGACY_PYRAMID_ON_STARTUP} | mode=LEDGER_OWNED_ONLY")
         logger.info(f"LEGACY RANGE RETIRE | enabled={RETIRE_LEGACY_RANGE_ON_STARTUP} | mode=ONE_SHOT_LEDGER_OWNED_ONLY")
         logger.info(f"INHERITED RANGE PROTECT RESET | enabled={RESET_INHERITED_RANGE_PROTECT_ON_STARTUP} | mode=ONE_SHOT_STATE_ONLY_ACCOUNTING_PRESERVED")
