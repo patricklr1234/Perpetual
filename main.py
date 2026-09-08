@@ -106,7 +106,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.45.0-v60-dynamic-recovery-margin"
+VERSION = "5.46.0-v61-exact-decimal-ledger-repair"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -1716,10 +1716,18 @@ class FillLedger:
         return len(rows)
 
     def open_strategy_qty(self, strategy_id: str, symbol: str, side: str) -> Decimal:
+        """Exact Decimal ownership sum.
+
+        Never aggregate TEXT quantities through SQLite REAL: binary floating-point can turn
+        an exact 0.014 into 0.013999999999999999. At BTC step=0.001 that is enough for a
+        later floor_step() to incorrectly discard one whole contract step.
+        """
         with self.lock:
-            row = self.db.execute("SELECT COALESCE(SUM(CAST(open_qty AS REAL)),0) FROM lots WHERE strategy_id=? AND symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
-                                  (strategy_id, symbol, side)).fetchone()
-        return dec(row[0] if row else 0)
+            rows = self.db.execute(
+                "SELECT open_qty FROM lots WHERE strategy_id=? AND symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
+                (strategy_id, symbol, side),
+            ).fetchall()
+        return sum((dec(row[0]) for row in rows), D(0))
 
     def order_owner(self, client_id: str) -> Optional[str]:
         """Return durable strategy ownership for a known clientOrderId, if any."""
@@ -1764,23 +1772,22 @@ class FillLedger:
         return out
 
     def open_strategy_breakdown(self, symbol: str, side: str) -> Dict[str, Decimal]:
-        """Retorna ownership persistente do FillLedger para symbol/positionSide."""
+        """Exact durable ownership by strategy, summed in Python Decimal."""
         out: Dict[str, Decimal] = {}
         with self.lock:
             rows = self.db.execute(
                 """
-                SELECT strategy_id, COALESCE(SUM(CAST(open_qty AS REAL)),0)
+                SELECT strategy_id, open_qty
                 FROM lots
                 WHERE symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0
-                GROUP BY strategy_id
+                ORDER BY strategy_id, opened_ms, leg_id
                 """,
                 (str(symbol).upper(), str(side).upper()),
             ).fetchall()
         for strategy_id, raw_qty in rows:
-            qty = dec(raw_qty)
-            if qty > 0:
-                out[str(strategy_id)] = qty
-        return out
+            sid = str(strategy_id)
+            out[sid] = out.get(sid, D(0)) + dec(raw_qty)
+        return {sid: qty for sid, qty in out.items() if qty > 0}
 
     def open_lots_by_strategy_prefix(self, prefix: str) -> List[Dict[str, Any]]:
         """Lots ainda abertos cujo strategy_id começa com prefix."""
@@ -3200,11 +3207,30 @@ class RangeEngine:
         return max(D(0), actual - reserved)
 
     def _reconcile_range_ghost_legs(self, b: Dict[str, Any], price: Decimal) -> bool:
+        """Synchronize recovery-basket leg quantities against exact ledger ownership + exchange.
+
+        V61 fixes a production bug where SQLite SUM(CAST(... AS REAL)) represented 0.014 BTC
+        as 0.013999999999999999. The old floor_step() then shrank a valid 0.013 leg to 0.012,
+        creating STATE_LEDGER_MISMATCH while ledger and exchange still agreed.
+
+        For a leg whose durable leg_id still exists in the ledger, the durable Decimal open_qty
+        is authoritative, capped by physical capacity after reserving other strategies. This can
+        safely restore a state leg that was spuriously reduced. Native basket protection is
+        synchronously rebuilt for the corrected quantities before returning.
+        """
         if not LIVE_TRADING:
             return False
         legs = list(b.get("legs") or [])
         if not legs:
             return False
+
+        # Exact durable quantities keyed by the same client/leg id stored in strategy state.
+        durable_by_id: Dict[str, Decimal] = {}
+        for ps in ("LONG", "SHORT"):
+            for lot in self.exe.ledger.open_lots_for_symbol_side(self.symbol, ps):
+                if str(lot.get("strategy_id") or "") == self.id:
+                    durable_by_id[str(lot.get("id") or "")] = dec(lot.get("qty"))
+
         changed = False
         rebuilt: List[Dict[str, Any]] = []
         by_side_capacity = {
@@ -3212,35 +3238,54 @@ class RangeEngine:
             "SHORT": self._range_physical_capacity("SHORT"),
         }
         used = {"LONG": D(0), "SHORT": D(0)}
+        step = self.exe.rules.rules[self.symbol].step_size
+
         for leg in legs:
             side = str(leg.get("side", "")).upper()
             qty = dec(leg.get("qty"))
             if side not in ("LONG", "SHORT") or qty <= 0:
                 continue
+
+            leg_id = str(leg.get("id") or "")
+            durable_qty = durable_by_id.get(leg_id)
+            target_qty = durable_qty if durable_qty is not None and durable_qty > 0 else qty
+
             available = max(D(0), by_side_capacity[side] - used[side])
-            keep = min(qty, available)
-            step = self.exe.rules.rules[self.symbol].step_size
+            keep = min(target_qty, available)
             keep = floor_step(keep, step)
+
             if keep <= 0:
                 changed = True
                 logger.warning(
-                    f"RANGE GHOST LEG REMOVIDA | {self.symbol} | side={side} leg={leg.get('id')} virtual_qty={qty} "
+                    f"RANGE GHOST LEG REMOVIDA | {self.symbol} | side={side} leg={leg_id} virtual_qty={qty} "
+                    f"durable_qty={durable_qty if durable_qty is not None else '-'} "
                     f"physical_capacity={by_side_capacity[side]} reserved_other={self._other_strategy_reserved_qty(side)}"
                 )
                 continue
-            if keep < qty:
+
+            new_leg = dict(leg)
+            if keep != qty:
                 changed = True
-                new_leg = dict(leg)
                 new_leg["qty"] = str(keep)
                 new_leg["notional"] = str(keep * dec(new_leg.get("entry_price")))
-                leg = new_leg
-                logger.warning(
-                    f"RANGE GHOST LEG REDUZIDA | {self.symbol} | side={side} leg={leg.get('id')} old_qty={qty} new_qty={keep}"
-                )
-            rebuilt.append(leg)
+                if keep > qty and durable_qty is not None:
+                    logger.warning(
+                        f"RANGE STATE LEG RESTAURADA DO LEDGER | {self.symbol} | side={side} leg={leg_id} "
+                        f"old_qty={qty} new_qty={keep} durable_qty={durable_qty} "
+                        f"physical_capacity={by_side_capacity[side]}"
+                    )
+                else:
+                    logger.warning(
+                        f"RANGE GHOST LEG REDUZIDA | {self.symbol} | side={side} leg={leg_id} "
+                        f"old_qty={qty} new_qty={keep} durable_qty={durable_qty if durable_qty is not None else '-'}"
+                    )
+            rebuilt.append(new_leg)
             used[side] += keep
+
         if not changed:
             return False
+
+        # Protection must match the corrected virtual quantities before trading continues.
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
         if b.get("native_bracket"):
@@ -3250,6 +3295,7 @@ class RangeEngine:
         b["native_bracket"] = None
         b["legs"] = rebuilt
         st = self.st()
+
         if not rebuilt:
             st["basket"] = None
             st["status"] = "PROTECT" if dec(st.get("recovery_deficit")) > 0 else "IDLE"
@@ -3264,9 +3310,49 @@ class RangeEngine:
                 f"status={st['status']} equity_preservada={st.get('equity')} RD_preservado={st.get('recovery_deficit')}"
             )
             return True
+
         b["active_side"] = str(rebuilt[-1].get("side"))
         st["last_update"] = now_iso()
         self.store.save()
+
+        # This helper is reached only for recovery baskets (alternations > 0), therefore
+        # recovery_tp/recovery_stop are the authoritative basket protection targets.
+        if NATIVE_PROTECTIVE_ORDERS:
+            rtp = dec(b.get("recovery_tp_price"))
+            rsl = dec(b.get("recovery_stop_price"))
+            if rtp <= 0 or rsl <= 0:
+                reason = f"RANGE_LEDGER_STATE_REPAIR_NO_RECOVERY_TARGETS:{self.id}"
+                self.store.set_protection_block(self.id, reason)
+                raise RuntimeError(reason)
+            try:
+                b["native_basket_exit"] = self.exe.install_basket_exit(
+                    self.id + ":TP", self.symbol, b["legs"], rtp, price
+                )
+                b["native_basket_stop"] = self.exe.install_basket_exit(
+                    self.id + ":SL", self.symbol, b["legs"], rsl, price
+                )
+                self.store.set_protection_block(self.id, None)
+                st["last_update"] = now_iso()
+                self.store.save()
+                logger.warning(
+                    f"RANGE LEDGER/STATE PROTECTION RESTORED | {self.symbol} grid={self.grid_id} | "
+                    f"TP={rtp} SL={rsl} | qtys="
+                    f"{[(x.get('side'), x.get('qty')) for x in b.get('legs', [])]}"
+                )
+            except Exception as exc:
+                try:
+                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
+                finally:
+                    b["native_basket_exit"] = None
+                    b["native_basket_stop"] = None
+                    self.store.set_protection_block(
+                        self.id, f"RANGE_LEDGER_STATE_REPAIR_PROTECTION_FAILED:{exc}"
+                    )
+                    st["last_update"] = now_iso()
+                    self.store.save()
+                raise
+
         return False
 
     def _new_anchor(self, price: Decimal) -> None:
@@ -4603,6 +4689,9 @@ def run_internal_regression_checks() -> None:
     assert AccountManager.logical_margin_budget_applies(0) is True
     assert AccountManager.logical_margin_budget_applies(1) is False
     assert AccountManager.logical_margin_budget_applies(2) is False
+    # V61 regression: durable quantities must stay exact at exchange step boundaries.
+    assert sum((dec(x) for x in ("0.001", "0.013")), D(0)) == D("0.014")
+    assert floor_step(D("0.014") - D("0.001"), D("0.001")) == D("0.013")
 
     # Regression: a recovery may require more isolated margin than its logical bankroll,
     # but it must still pass when stop-risk <= equity and physical/cap constraints fit.
@@ -5506,7 +5595,7 @@ class Bot:
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"HARDENING | state_backup={STATE_BACKUP_FILE} | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
         logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD} | min_lot_overshoot_cap={MAX_MIN_LOT_OVERSHOOT_MULTIPLIER}x | range_dynamic_safety={RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER}x")
-        logger.info("CAPITAL GUIDE | BTC RANGE bankroll=40/grid (4 grids=160) | recommended_real_wallet_usd=150 under current symbol caps; logical bankroll is not reserved physical cash")
+        logger.info("CAPITAL GUIDE | BTC RANGE bankroll=40/grid (4 grids=160) | operational_wallet_target_usd=100 after dynamic recovery sizing; not a guarantee against simultaneous worst-case symbol caps; logical bankroll is not reserved physical cash")
         logger.info(f"LEGACY PYRAMID RETIRE | enabled={RETIRE_LEGACY_PYRAMID_ON_STARTUP} | mode=LEDGER_OWNED_ONLY")
         logger.info(f"LEGACY RANGE RETIRE | enabled={RETIRE_LEGACY_RANGE_ON_STARTUP} | mode=ONE_SHOT_LEDGER_OWNED_ONLY")
         logger.info(f"INHERITED RANGE PROTECT RESET | enabled={RESET_INHERITED_RANGE_PROTECT_ON_STARTUP} | mode=ONE_SHOT_STATE_ONLY_ACCOUNTING_PRESERVED")
@@ -5569,6 +5658,41 @@ class Bot:
                                     state_bucket="range_grids", state_key=f"{symbol}:{gid}",
                                     grid_id=gid, grid_phase=phase, allow_new_entries=True)
                     )
+
+            # V61: repair the exact production failure from V60 before market-data loop starts.
+            # This is state/ledger/protection synchronization only; it never creates exposure.
+            repaired_any = False
+            for _engine in self.range_engines:
+                _st = _engine.st()
+                _basket = _st.get("basket") or {}
+                if int(_basket.get("alternations", 0) or 0) <= 0:
+                    continue
+                _before = [
+                    (str(x.get("id") or ""), str(x.get("side") or ""), str(x.get("qty") or "0"))
+                    for x in (_basket.get("legs") or [])
+                ]
+                _mark = self.client.mark(_engine.symbol)
+                _engine._reconcile_range_ghost_legs(_basket, _mark)
+                _after_basket = (_engine.st().get("basket") or {})
+                _after = [
+                    (str(x.get("id") or ""), str(x.get("side") or ""), str(x.get("qty") or "0"))
+                    for x in (_after_basket.get("legs") or [])
+                ]
+                if _before != _after:
+                    repaired_any = True
+                    logger.warning(
+                        "STARTUP RANGE EXACT-LEDGER REPAIR | %s grid=%s | before=%s after=%s",
+                        _engine.symbol, _engine.grid_id, _before, _after,
+                    )
+            if repaired_any:
+                if not self.reconciler.reconcile():
+                    logger.warning(
+                        "STARTUP RANGE EXACT-LEDGER REPAIR | reparo aplicado mas reconcile ainda nao ficou OK; "
+                        "entry gate permanece fail-closed"
+                    )
+                else:
+                    logger.info("STARTUP RANGE EXACT-LEDGER REPAIR | RECONCILE OK")
+
         if MACD_ENGINE_ENABLED:
             self.macd_engines = [MacdEngine(s, tf, self.client, self.md, self.news, self.account, self.exe, self.store)
                                  for s in SYMBOLS for tf in MACD_TIMEFRAMES]
@@ -6130,9 +6254,10 @@ class Bot:
                 except Exception:
                     x_recovery = 0
                 x_multiplier_base = dec(x.get("recovery_multiplier_base"), str(RECOVERY_MULTIPLIER))
-                x_multiplier = x_multiplier_base ** x_recovery
+                x_level_cap_multiplier = x_multiplier_base ** x_recovery
                 x_base_notional = dec(x.get("base_notional"), str(configured_initial_notional(symbol)))
                 x_notional = x_qty * mark if mark > 0 else D(0)
+                x_multiplier = (x_notional / x_base_notional) if x_base_notional > 0 else D(0)
                 x_mode = "NORMAL" if x_recovery == 0 else "RECOVERY"
                 virtual_lot_parts.append(
                     f"{x['strategy']}:{side}"
@@ -6142,6 +6267,7 @@ class Bot:
                     f"|mode={x_mode}"
                     f"|recovery_level={x_recovery}"
                     f"|multiplier={dstr(x_multiplier, 4)}x"
+                    f"|level_cap_multiplier={dstr(x_level_cap_multiplier, 4)}x"
                     f"|base_notional_usd={dstr(x_base_notional, 8)}"
                     f"|tp={x.get('target','-')}"
                     f"|sl={x.get('stop','-')}"
@@ -6195,13 +6321,14 @@ class Bot:
                 except Exception:
                     x_recovery = 0
                 x_multiplier_base = dec(x.get("recovery_multiplier_base"), str(RECOVERY_MULTIPLIER))
-                x_multiplier = x_multiplier_base ** x_recovery
+                x_level_cap_multiplier = x_multiplier_base ** x_recovery
                 x_base_notional = dec(x.get("base_notional"), str(configured_initial_notional(symbol)))
                 x_notional = x_qty * mark if mark > 0 else D(0)
+                x_multiplier = (x_notional / x_base_notional) if x_base_notional > 0 else D(0)
                 x_mode = "NORMAL" if x_recovery == 0 else "RECOVERY"
                 logger.warning(
                     f"VIRTUAL STRATEGY | strategy={x.get('strategy')} | symbol={symbol} side={side} | qty={dstr(x_qty, 8)} | notional_usd={dstr(x_notional, 8)} | "
-                    f"mode={x_mode} | recovery_level={x_recovery} | multiplier={dstr(x_multiplier, 4)}x | base_notional_usd={dstr(x_base_notional, 8)} | tp={x.get('target', '-')} | sl={x.get('stop', '-')}"
+                    f"mode={x_mode} | recovery_level={x_recovery} | multiplier={dstr(x_multiplier, 4)}x | level_cap_multiplier={dstr(x_level_cap_multiplier, 4)}x | base_notional_usd={dstr(x_base_notional, 8)} | tp={x.get('target', '-')} | sl={x.get('stop', '-')}"
                 )
         if found == 0:
             logger.info("POSITION SNAPSHOT | nenhuma posicao real aberta")
