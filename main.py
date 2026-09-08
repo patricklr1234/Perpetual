@@ -36,6 +36,8 @@ Risco e execução:
   - Recovery RANGE faz preflight de sizing antes de cancelar proteções existentes.
   - Overshoot de notional inicial só é aceito quando for imposto pelo lote/notional
     mínimo da exchange e continuar dentro dos limites lógicos de risco/margem.
+  - Bankroll limita risco econômico no stop; recovery não é bloqueado apenas porque
+    a margem nominal da perna supera o bankroll, desde que risco/caps/margem física caibam.
   - FULL FACTORY RESET é opt-in em produção (default OFF).
 
 Sizing:
@@ -104,7 +106,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.42.0-v57-safety-recovery-minlot-fix"
+VERSION = "5.43.0-v58-final-consolidated"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -2043,6 +2045,17 @@ class AccountManager:
         desired = min(desired, eq * MAX_MARGIN_FRACTION_PER_STRATEGY)
         return max(D(0), desired)
 
+    @staticmethod
+    def logical_margin_budget_applies(recovery_level: int) -> bool:
+        """Fresh entries must fit the strategy bankroll as margin; recovery is governed by
+        stop-risk, physical free margin and symbol/recovery caps instead.
+
+        The bankroll is a logical risk envelope, not a requirement that every recovery leg's
+        nominal isolated margin be <= bankroll. This distinction is essential for the intended
+        4x RANGE / 2x MACD recovery architecture.
+        """
+        return int(recovery_level) <= 0
+
     def sizing_for_profit_target(self, symbol: str, price: Decimal, strategy_state: Dict[str, Any],
                                  target_profit: Optional[Decimal], target_move_pct: Decimal,
                                  adverse_distance_pct: Decimal, recovery_level: int = 0,
@@ -2131,7 +2144,11 @@ class AccountManager:
                         f"limite_com_tolerancia={max_allowed} min_qty={rule.min_qty} step={rule.step_size} price={price}"
                     )
                     return None
-        if actual_margin > base_budget:
+        # Fresh entries must respect the logical margin budget even after exchange lot
+        # rounding/min-notional adaptation. Recovery legs are intentionally different:
+        # the bankroll is their stop-risk envelope, while physical margin and hard caps are
+        # checked separately below.
+        if self.logical_margin_budget_applies(recovery_level) and actual_margin > base_budget:
             logger.warning(
                 f"SIZING LOGICAL MARGIN BLOCK | {symbol} | margin_necessaria={actual_margin} "
                 f"orcamento_logico={base_budget} notional={actual_notional} lev={lev}x level={recovery_level}"
@@ -4548,11 +4565,72 @@ def run_internal_regression_checks() -> None:
     assert RANGE_GRID_BANKROLL_USD > 0 and BTC_RANGE_GRID_BANKROLL_USD > 0
     assert MAX_MIN_LOT_OVERSHOOT_MULTIPLIER >= D(1)
     assert FULL_FACTORY_RESET_ON_STARTUP in (True, False)
+    assert AccountManager.logical_margin_budget_applies(0) is True
+    assert AccountManager.logical_margin_budget_applies(1) is False
+    assert AccountManager.logical_margin_budget_applies(2) is False
+
+    # Regression: a recovery may require more isolated margin than its logical bankroll,
+    # but it must still pass when stop-risk <= equity and physical/cap constraints fit.
+    class _SelfTestStore:
+        def save(self) -> None:
+            return None
+    _am = object.__new__(AccountManager)
+    _am.store = _SelfTestStore()
+    _am.rules = object.__new__(RulesBook)
+    _am.rules.rules = {
+        "BTCUSDT": SymbolRules("BTCUSDT", D("0.1"), D("0.001"), D("0.001"), D("100"), D("5"))
+    }
+    _am.sync = lambda *args, **kwargs: None
+    _am.free_margin = lambda *args, **kwargs: D("1000")
+    _am.base_margin_budget = lambda strategy_state: D("10")
+    _am.safe_leverage_cap = lambda symbol, notional, adverse: (30, {"self_test": True})
+    _am.current_symbol_notional = lambda symbol: D("0")
+    _st = {
+        "strategy": "RANGE:BTCUSDT:G0", "grid_id": "G0",
+        "equity": "10", "bankroll_config_base": "10",
+        "basket": {"legs": [{"qty": "0.001"}]},
+    }
+    _recovery_ok = AccountManager.sizing_for_profit_target(
+        _am, "BTCUSDT", D("80000"), _st,
+        D("1"), RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
+        recovery_level=1, desired_notional_override=D("400"),
+        recovery_multiplier=RECOVERY_MULTIPLIER,
+    )
+    assert _recovery_ok is not None
+    assert dec(_recovery_ok["margin"]) > D("10")
+    assert dec(_recovery_ok["estimated_adverse_loss"]) <= D("10")
+
+    # Level 2 (nominal 1600 at 2% adverse = 32) must be rejected by stop-risk.
+    _recovery_block = AccountManager.sizing_for_profit_target(
+        _am, "BTCUSDT", D("80000"), _st,
+        D("1"), RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
+        recovery_level=2, desired_notional_override=D("1600"),
+        recovery_multiplier=RECOVERY_MULTIPLIER,
+    )
+    assert _recovery_block is None
+
+    # ETH fresh $5 may round to the true exchange-minimum lot above +5%; the adaptation
+    # is allowed only when it is exactly the minimum executable quantity.
+    _am.rules.rules["ETHUSDT"] = SymbolRules("ETHUSDT", D("0.01"), D("0.001"), D("0.001"), D("100"), D("5"))
+    _am.base_margin_budget = lambda strategy_state: D("5")
+    _am.safe_leverage_cap = lambda symbol, notional, adverse: (30, {"self_test": True})
+    _st_eth = {
+        "strategy": "RANGE:ETHUSDT:G0", "grid_id": "G0",
+        "equity": "5", "bankroll_config_base": "5", "basket": None,
+    }
+    _eth_fresh = AccountManager.sizing_for_profit_target(
+        _am, "ETHUSDT", D("2482.28"), _st_eth,
+        None, RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
+        recovery_level=0, recovery_multiplier=RECOVERY_MULTIPLIER,
+    )
+    assert _eth_fresh is not None
+    assert dec(_eth_fresh["notional"]) == D("0.003") * D("2482.28")
+
     p = D("100")
     anchors = [p * (D(1) + phase) for phase in RANGE_GRID_PHASES]
     assert anchors == [D("100"), D("100.2500"), D("100.500"), D("100.7500")]
     assert len(set(anchors)) == 4
-    logger.info("SELF TEST | PASS | range-subgrids/ledger/recovery/risk/tick/native-stop/bankroll-separation/legacy-pyramid-retire invariants")
+    logger.info("SELF TEST | PASS | range-subgrids/ledger/recovery/risk/min-lot/native-stop/bankroll-separation/factory-reset-off invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
