@@ -100,7 +100,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.40.0-v55-risk-stop-reconcile-fix"
+VERSION = "5.41.0-v56-fee-model-observability-fix"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -192,6 +192,7 @@ MACD_TRAILING_ACTIVATION_PCT = D(os.getenv("MACD_TRAILING_ACTIVATION_PCT", "0.02
 MACD_TRAILING_DISTANCE_PCT = D(os.getenv("MACD_TRAILING_DISTANCE_PCT", "0.02"))
 MACD_HARD_STOP_PCT = D(os.getenv("MACD_HARD_STOP_PCT", "0.02"))
 MACD_NATIVE_TRAILING_ENABLED = os.getenv("MACD_NATIVE_TRAILING_ENABLED", "1") == "1"
+TAKER_FEE_RATE = D(os.getenv("TAKER_FEE_RATE", "0.0004"))
 PROTECTIVE_WATCHDOG_SECONDS = float(os.getenv("PROTECTIVE_WATCHDOG_SECONDS", "5"))
 
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "5000"))
@@ -272,6 +273,7 @@ def validate_runtime_config() -> None:
     require(MACD_FAST > 0 and MACD_SLOW > MACD_FAST and MACD_SIGNAL > 0, f"MACD invalido: fast={MACD_FAST} slow={MACD_SLOW} signal={MACD_SIGNAL}")
     require(MACD_REARM_PCT > 0 and MACD_TRAILING_ACTIVATION_PCT > 0 and MACD_TRAILING_DISTANCE_PCT > 0 and MACD_HARD_STOP_PCT > 0, "percentuais MACD devem ser >0")
     require(PROTECTIVE_WORKING_TYPE in ("MARK_PRICE", "CONTRACT_PRICE"), f"PROTECTIVE_WORKING_TYPE invalido: {PROTECTIVE_WORKING_TYPE}")
+    require(D(0) <= TAKER_FEE_RATE < D("0.01"), f"TAKER_FEE_RATE invalida: {TAKER_FEE_RATE}")
 
     for name, value in (("HTTP_TIMEOUT", HTTP_TIMEOUT), ("ORDER_FILL_WAIT_SECONDS", ORDER_FILL_WAIT_SECONDS), ("ORDER_POLL_SECONDS", ORDER_POLL_SECONDS),
                         ("MAIN_LOOP_SECONDS", MAIN_LOOP_SECONDS), ("REST_PRICE_FALLBACK_SECONDS", REST_PRICE_FALLBACK_SECONDS), ("HEARTBEAT_SECONDS", HEARTBEAT_SECONDS),
@@ -2385,7 +2387,7 @@ class ExecutionEngine:
                       close_client_id: str, exit_source: str) -> Dict[str, Any]:
         entry = dec(leg["entry_price"])
         gross = (exitp - entry) * closed_qty if leg["side"] == "LONG" else (entry - exitp) * closed_qty
-        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        fee_rate = TAKER_FEE_RATE
         entry_fee_est = entry * closed_qty * fee_rate
         exit_fee_est = exitp * closed_qty * fee_rate
         fees_est = entry_fee_est + exit_fee_est
@@ -3226,7 +3228,7 @@ class RangeEngine:
 
     @staticmethod
     def estimated_net_pnl(legs: List[Dict[str, Any]], exit_price: Decimal) -> Decimal:
-        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        fee_rate = TAKER_FEE_RATE
         total = D(0)
         for leg in legs:
             qty = dec(leg["qty"])
@@ -3246,7 +3248,7 @@ class RangeEngine:
         if AUTO_SCALE_NOTIONAL_WITH_EQUITY:
             base_notional = max(base_notional, dec(st.get("equity")))
         desired_basket_profit = dec(st.get("recovery_deficit")) + base_notional * RANGE_TAKE_PROFIT_PCT
-        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        fee_rate = TAKER_FEE_RATE
         move_yield = abs(tp_price - entry_price) / entry_price
         round_trip_fee_yield = fee_rate * (D(1) + tp_price / entry_price)
         net_yield = move_yield - round_trip_fee_yield
@@ -5253,7 +5255,7 @@ class Bot:
         logger.info(f"SYMBOLS={SYMBOLS} | RANGE={RANGE_ENGINE_ENABLED} mode={RANGE_SIGNAL_MODE} SUBGRIDS={RANGE_GRID_PHASES} | MACD_SEPARADO={MACD_ENGINE_ENABLED} TF={MACD_TIMEFRAMES}")
         logger.info(f"MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV={MAX_REQUESTED_LEVERAGE} | BOT_HARD_CAP={BOT_HARD_MAX_LEVERAGE} | API_HARD_CAP={API_HARD_MAX_LEVERAGE}")
         logger.info(f"MACD BASE ETH/HYPE bankroll={INITIAL_BANKROLL_USD} notional={INITIAL_OPERATION_NOTIONAL_USD} | MACD BTC bankroll={BTC_INITIAL_BANKROLL_USD} notional={BTC_INITIAL_OPERATION_NOTIONAL_USD} | RANGE GRID ETH/HYPE bankroll={RANGE_GRID_BANKROLL_USD} notional={RANGE_GRID_INITIAL_NOTIONAL_USD} | RANGE GRID BTC bankroll={BTC_RANGE_GRID_BANKROLL_USD} notional={BTC_RANGE_GRID_INITIAL_NOTIONAL_USD} | autoscale_notional={AUTO_SCALE_NOTIONAL_WITH_EQUITY}")
-        logger.info(f"EXITS | RANGE_TP={RANGE_TAKE_PROFIT_PCT} RANGE_STOP={RANGE_HARD_STOP_PCT} | MACD: trailing_activation={MACD_TRAILING_ACTIVATION_PCT} trailing_distance={MACD_TRAILING_DISTANCE_PCT} stop_loss={MACD_HARD_STOP_PCT}")
+        logger.info(f"EXITS | RANGE_TP={RANGE_TAKE_PROFIT_PCT} RANGE_STOP={RANGE_HARD_STOP_PCT} | MACD: trailing_activation={MACD_TRAILING_ACTIVATION_PCT} trailing_distance={MACD_TRAILING_DISTANCE_PCT} stop_loss={MACD_HARD_STOP_PCT} | fee_model_taker={TAKER_FEE_RATE}")
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"HARDENING | state_backup={STATE_BACKUP_FILE} | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
@@ -5747,7 +5749,8 @@ class Bot:
 
         def add_logical(symbol: str, side: str, strategy: str, vqty: Decimal,
                         target: Any = "-", stop: Any = "-", recovery: Any = "-",
-                        virtual_entry: Any = "-") -> None:
+                        virtual_entry: Any = "-", base_notional: Any = None,
+                        recovery_multiplier_base: Any = None) -> None:
             symbol = str(symbol).upper()
             side = str(side).upper()
             if symbol not in SYMBOLS or side not in ("LONG", "SHORT") or vqty <= 0:
@@ -5755,6 +5758,8 @@ class Bot:
             logical.setdefault((symbol, side), []).append({
                 "strategy": strategy, "qty": vqty, "target": target,
                 "stop": stop, "recovery": recovery, "entry": virtual_entry,
+                "base_notional": base_notional,
+                "recovery_multiplier_base": recovery_multiplier_base,
             })
 
         for _state_key, rst in state_range.items():
@@ -5780,6 +5785,8 @@ class Bot:
                     basket.get("recovery_stop_price") or basket.get("hard_stop_price") or "-",
                     basket.get("alternations", 0),
                     ventry,
+                    configured_strategy_initial_notional(symbol, rst),
+                    RECOVERY_MULTIPLIER,
                 )
 
         for key, mst in state_macd.items():
@@ -5797,6 +5804,8 @@ class Bot:
                     pos.get("hard_stop_price") or "-",
                     pos.get("recovery_level", mst.get("recovery_level", mst.get("loss_streak", 0))),
                     leg.get("entry_price") or "-",
+                    configured_strategy_initial_notional(symbol, mst),
+                    MACD_RECOVERY_MULTIPLIER,
                 )
 
         for p in (positions if isinstance(positions, list) else []):
@@ -5872,8 +5881,9 @@ class Bot:
                     x_recovery = max(0, int(x_recovery_raw))
                 except Exception:
                     x_recovery = 0
-                x_multiplier = RECOVERY_MULTIPLIER ** x_recovery
-                x_base_notional = configured_initial_notional(symbol)
+                x_multiplier_base = dec(x.get("recovery_multiplier_base"), str(RECOVERY_MULTIPLIER))
+                x_multiplier = x_multiplier_base ** x_recovery
+                x_base_notional = dec(x.get("base_notional"), str(configured_initial_notional(symbol)))
                 x_notional = x_qty * mark if mark > 0 else D(0)
                 x_mode = "NORMAL" if x_recovery == 0 else "RECOVERY"
                 virtual_lot_parts.append(
@@ -5936,8 +5946,9 @@ class Bot:
                     x_recovery = max(0, int(x.get("recovery", 0)))
                 except Exception:
                     x_recovery = 0
-                x_multiplier = RECOVERY_MULTIPLIER ** x_recovery
-                x_base_notional = configured_initial_notional(symbol)
+                x_multiplier_base = dec(x.get("recovery_multiplier_base"), str(RECOVERY_MULTIPLIER))
+                x_multiplier = x_multiplier_base ** x_recovery
+                x_base_notional = dec(x.get("base_notional"), str(configured_initial_notional(symbol)))
                 x_notional = x_qty * mark if mark > 0 else D(0)
                 x_mode = "NORMAL" if x_recovery == 0 else "RECOVERY"
                 logger.warning(
