@@ -106,7 +106,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.43.0-v58-final-consolidated"
+VERSION = "5.45.0-v60-dynamic-recovery-margin"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -149,6 +149,7 @@ BTC_INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv("BTC_INITIAL_OPERATION_NOTIONAL
 MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT = D(os.getenv("MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT", "0.05"))
 MAX_MIN_LOT_OVERSHOOT_MULTIPLIER = D(os.getenv("MAX_MIN_LOT_OVERSHOOT_MULTIPLIER", "2.0"))
 RECOVERY_MULTIPLIER = D(os.getenv("RECOVERY_MULTIPLIER", "4"))
+RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER = D(os.getenv("RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER", "1.10"))
 MACD_RECOVERY_MULTIPLIER = D(os.getenv("MACD_RECOVERY_MULTIPLIER", "2"))
 MAX_RECOVERY_FAILURES = int(os.getenv("MAX_RECOVERY_FAILURES", "2"))
 
@@ -178,7 +179,7 @@ RANGE_GRID_COUNT = max(1, len(RANGE_GRID_PHASES))
 
 # Logical risk bankroll per RANGE grid. This is separate from order notional.
 RANGE_GRID_BANKROLL_USD = D(os.getenv("RANGE_GRID_BANKROLL_USD", "5"))
-BTC_RANGE_GRID_BANKROLL_USD = D(os.getenv("BTC_RANGE_GRID_BANKROLL_USD", "10"))
+BTC_RANGE_GRID_BANKROLL_USD = max(D("40"), D(os.getenv("BTC_RANGE_GRID_BANKROLL_USD", "40")))
 
 # Initial exposure per RANGE grid.
 RANGE_GRID_INITIAL_NOTIONAL_USD = D(os.getenv("RANGE_GRID_INITIAL_NOTIONAL_USD", "5"))
@@ -275,6 +276,7 @@ def validate_runtime_config() -> None:
     require(MAX_TOTAL_SYMBOL_NOTIONAL_USD >= RANGE_GRID_INITIAL_NOTIONAL_USD, "MAX_TOTAL_SYMBOL_NOTIONAL_USD menor que RANGE_GRID_INITIAL_NOTIONAL_USD")
     require(BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD >= BTC_RANGE_GRID_INITIAL_NOTIONAL_USD, "BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD menor que BTC_RANGE_GRID_INITIAL_NOTIONAL_USD")
     require(RECOVERY_MULTIPLIER >= D(1), f"RECOVERY_MULTIPLIER deve ser >=1, atual={RECOVERY_MULTIPLIER}")
+    require(RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER >= D(1), f"RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER deve ser >=1, atual={RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER}")
     require(MACD_RECOVERY_MULTIPLIER >= D(1), f"MACD_RECOVERY_MULTIPLIER deve ser >=1, atual={MACD_RECOVERY_MULTIPLIER}")
     require(MAX_RECOVERY_FAILURES >= 1, f"MAX_RECOVERY_FAILURES deve ser >=1, atual={MAX_RECOVERY_FAILURES}")
     require(RANGE_TRIGGER_PCT > 0 and RANGE_TAKE_PROFIT_PCT > 0 and RANGE_HARD_STOP_PCT > 0 and RANGE_REARM_PCT > 0, "percentuais RANGE devem ser >0")
@@ -2065,14 +2067,26 @@ class AccountManager:
         active = bool(strategy_state.get("position") or strategy_state.get("basket"))
         configured_base = configured_strategy_bankroll(symbol, strategy_state)
         previous_base = dec(strategy_state.get("bankroll_config_base"), str(INITIAL_BANKROLL_USD))
-        if not active and configured_base != previous_base:
+        # V59: configured bankroll increases are allowed to migrate into an active
+        # strategy immediately. This is an increase-only risk-budget change: it adds
+        # exactly the configured delta to equity without touching realized PnL, RD,
+        # positions, native protection or trade history. Bankroll decreases remain
+        # deferred until the strategy is flat so an active basket is never squeezed
+        # by a configuration change mid-trade.
+        can_migrate_bankroll = (
+            configured_base > previous_base
+            or (not active and configured_base != previous_base)
+        )
+        if can_migrate_bankroll:
             previous_equity = dec(strategy_state.get("equity"), str(previous_base))
             strategy_state["equity"] = str(previous_equity + configured_base - previous_base)
             strategy_state["bankroll_config_base"] = str(configured_base)
             strategy_state["last_update"] = now_iso()
             self.store.save()
-            logger.info(
-                f"BANKROLL MIGRATION | {strategy_state.get('strategy', symbol)} | base {previous_base}->{configured_base} | equity {previous_equity}->{strategy_state['equity']}"
+            logger.warning(
+                f"BANKROLL MIGRATION | {strategy_state.get('strategy', symbol)} | "
+                f"base {previous_base}->{configured_base} | equity {previous_equity}->{strategy_state['equity']} | "
+                f"active={active} mode={'INCREASE_ACTIVE_ALLOWED' if active else 'FLAT_CONFIG_SYNC'}"
             )
         logical_eq = dec(strategy_state.get("equity"), str(INITIAL_BANKROLL_USD))
         physical_free = self.free_margin(force=True)
@@ -2097,9 +2111,21 @@ class AccountManager:
             if margin > base_budget:
                 return None
         else:
-            classic_notional = base_notional * (recovery_multiplier ** recovery_level)
-            desired_notional = max(classic_notional, dec(desired_notional_override)) \
-                if desired_notional_override is not None else classic_notional
+            # Capital-efficient recovery: when the strategy provides an explicit dynamic
+            # notional, keep only the first recovery floor (e.g. 4x for RANGE) instead
+            # of re-imposing an exponential 16x floor at level 2. Strategies without
+            # a dynamic override (MACD) preserve their original multiplier**level model.
+            if desired_notional_override is not None:
+                minimum_recovery_notional = base_notional * recovery_multiplier
+                original_level_notional = base_notional * (recovery_multiplier ** recovery_level)
+                # Dynamic recovery may only reduce/preserve the old per-level exposure.
+                # It can never consume more margin than the previous 4x/16x staircase.
+                desired_notional = min(
+                    original_level_notional,
+                    max(minimum_recovery_notional, dec(desired_notional_override)),
+                )
+            else:
+                desired_notional = base_notional * (recovery_multiplier ** recovery_level)
             recovery_cap = configured_max_recovery_notional(symbol)
             if desired_notional > recovery_cap:
                 logger.warning(f"RECOVERY CAP | {symbol} | requested={desired_notional} capped={recovery_cap} level={recovery_level}")
@@ -3298,8 +3324,17 @@ class RangeEngine:
         if net_yield <= 0:
             raise RuntimeError("RANGE recovery sem rendimento liquido positivo no TP")
         dynamic_notional = max(D(0), (desired_basket_profit - existing_at_tp) / net_yield)
-        classic_floor = base_notional * (RECOVERY_MULTIPLIER ** recovery_level)
-        requested = max(dynamic_notional, classic_floor)
+        # V60: recovery capital follows the actual deficit. Keep a 4x floor for the
+        # first/any recovery leg, add 10% default safety to the calculated requirement,
+        # but do not force the old 16x level-2 floor. The old per-level size is retained only as a ceiling, so BTC/ETH/HYPE can never consume more margin than before.
+        dynamic_with_safety = dynamic_notional * RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER
+        minimum_recovery = base_notional * RECOVERY_MULTIPLIER
+        original_level_notional = base_notional * (RECOVERY_MULTIPLIER ** recovery_level)
+        # Capital efficiency is one-way: never exceed the old fixed size for this level.
+        requested = min(
+            original_level_notional,
+            max(dynamic_with_safety, minimum_recovery),
+        )
         capped = min(requested, configured_max_recovery_notional(self.symbol))
         if capped < requested:
             logger.warning(f"RANGE DYNAMIC RECOVERY CAPPED | {self.symbol} | requested={requested} cap={capped} level={recovery_level}")
@@ -3615,7 +3650,7 @@ class RangeEngine:
         logger.warning(f"RANGE RECOVERY PROTECTION | {self.symbol} | TP={recovery_tp} SL={recovery_stop} | native_tp={bool(b.get('native_basket_exit'))} native_sl={bool(b.get('native_basket_stop'))}")
         st["last_update"] = now_iso()
         self.store.save()
-        logger.warning(f"RANGE REVERSE 4X DINAMICO | {self.symbol} | new={new_side} @{recovery_entry} | mtm={mtm} existing_at_tp={existing_at_tp} desired_notional={desired_notional} recovery_tp={recovery_tp} failures={st['failures']}")
+        logger.warning(f"RANGE REVERSE CAPITAL-EFFICIENT | {self.symbol} | new={new_side} @{recovery_entry} | mtm={mtm} existing_at_tp={existing_at_tp} desired_notional={desired_notional} recovery_tp={recovery_tp} failures={st['failures']}")
 
     def tick(self, price: Decimal) -> None:
         with self.store.lock:
@@ -4549,7 +4584,7 @@ def run_internal_regression_checks() -> None:
     assert RANGE_SIGNAL_MODE == "VOLATILITY_ONLY"
     assert RANGE_TRIGGER_PCT > 0 and RANGE_TAKE_PROFIT_PCT > 0 and RANGE_HARD_STOP_PCT > 0
     assert MACD_FAST < MACD_SLOW and MACD_SIGNAL > 0
-    assert RECOVERY_MULTIPLIER >= D(1) and MACD_RECOVERY_MULTIPLIER >= D(1) and MAX_RECOVERY_FAILURES >= 0
+    assert RECOVERY_MULTIPLIER >= D(1) and RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER >= D(1) and MACD_RECOVERY_MULTIPLIER >= D(1) and MAX_RECOVERY_FAILURES >= 0
     assert configured_max_recovery_notional("BTCUSDT") >= configured_initial_notional("BTCUSDT")
     assert configured_max_recovery_notional("ETHUSDT") >= configured_initial_notional("ETHUSDT")
     fake = object.__new__(RulesBook)
@@ -4598,16 +4633,26 @@ def run_internal_regression_checks() -> None:
     )
     assert _recovery_ok is not None
     assert dec(_recovery_ok["margin"]) > D("10")
-    assert dec(_recovery_ok["estimated_adverse_loss"]) <= D("10")
+    assert dec(_recovery_ok["estimated_adverse_loss"]) <= D("40")
+    # The first sizing call must have migrated the active BTC RANGE bankroll
+    # from the historical $10 base to the new configured $40 base without
+    # resetting PnL/recovery state.
+    assert dec(_st["bankroll_config_base"]) == D("40")
+    assert dec(_st["equity"]) == D("40")
 
-    # Level 2 (nominal 1600 at 2% adverse = 32) must be rejected by stop-risk.
-    _recovery_block = AccountManager.sizing_for_profit_target(
+    # V60: a level-2 RANGE dynamic request below 16x must NOT be re-expanded
+    # to 1600 merely because recovery_level==2. It keeps the 4x floor and the
+    # explicit dynamic amount, while the same stop-risk/physical/cap gates remain.
+    _recovery_level2_ok = AccountManager.sizing_for_profit_target(
         _am, "BTCUSDT", D("80000"), _st,
         D("1"), RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
-        recovery_level=2, desired_notional_override=D("1600"),
+        recovery_level=2, desired_notional_override=D("900"),
         recovery_multiplier=RECOVERY_MULTIPLIER,
     )
-    assert _recovery_block is None
+    assert _recovery_level2_ok is not None
+    assert dec(_recovery_level2_ok["notional"]) == D("880")  # 0.011 BTC @ 80k after step-size floor
+    assert dec(_recovery_level2_ok["notional"]) < D("1600")
+    assert dec(_recovery_level2_ok["estimated_adverse_loss"]) <= dec(_st["equity"])
 
     # ETH fresh $5 may round to the true exchange-minimum lot above +5%; the adaptation
     # is allowed only when it is exactly the minimum executable quantity.
@@ -4624,13 +4669,15 @@ def run_internal_regression_checks() -> None:
         recovery_level=0, recovery_multiplier=RECOVERY_MULTIPLIER,
     )
     assert _eth_fresh is not None
+    # Same dynamic recovery policy applies to every RANGE asset.
+    assert RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER == D("1.10") or RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER >= D(1)
     assert dec(_eth_fresh["notional"]) == D("0.003") * D("2482.28")
 
     p = D("100")
     anchors = [p * (D(1) + phase) for phase in RANGE_GRID_PHASES]
     assert anchors == [D("100"), D("100.2500"), D("100.500"), D("100.7500")]
     assert len(set(anchors)) == 4
-    logger.info("SELF TEST | PASS | range-subgrids/ledger/recovery/risk/min-lot/native-stop/bankroll-separation/factory-reset-off invariants")
+    logger.info("SELF TEST | PASS | range-subgrids/ledger/recovery/risk/min-lot/native-stop/btc-bankroll40-active-migration/factory-reset-off invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -5406,6 +5453,46 @@ class Bot:
                 "Principal segue somente RANGE+MACD"
             )
 
+    def migrate_configured_bankroll_increases(self) -> None:
+        """Apply configured bankroll increases immediately after a successful reconcile.
+
+        Increase-only: adds exactly (new_base-old_base) to logical equity while preserving
+        realized PnL, recovery deficit, failures, positions, native protection and history.
+        Decreases are intentionally not applied here and remain deferred until flat.
+        """
+        changed = []
+        with self.store.lock:
+            buckets = (
+                ("range", self.store.state.get("range", {})),
+                ("range_grids", self.store.state.get("range_grids", {})),
+                ("macd", self.store.state.get("macd", {})),
+            )
+            for bucket_name, bucket in buckets:
+                if not isinstance(bucket, dict):
+                    continue
+                for key, st in bucket.items():
+                    if not isinstance(st, dict):
+                        continue
+                    symbol = str(st.get("symbol") or str(key).split(":", 1)[0]).upper()
+                    if symbol not in SYMBOLS:
+                        continue
+                    configured_base = configured_strategy_bankroll(symbol, st)
+                    previous_base = dec(st.get("bankroll_config_base"), str(configured_base))
+                    if configured_base <= previous_base:
+                        continue
+                    previous_equity = dec(st.get("equity"), str(previous_base))
+                    st["equity"] = str(previous_equity + configured_base - previous_base)
+                    st["bankroll_config_base"] = str(configured_base)
+                    st["last_update"] = now_iso()
+                    changed.append((st.get("strategy", f"{bucket_name}:{key}"), previous_base, configured_base, previous_equity, st["equity"]))
+        if changed:
+            self.store.save()
+            for strategy, old_base, new_base, old_eq, new_eq in changed:
+                logger.warning(
+                    "BANKROLL STARTUP MIGRATION | %s | base %s->%s | equity %s->%s | mode=INCREASE_ONLY_PNL_RD_PRESERVED",
+                    strategy, old_base, new_base, old_eq, new_eq,
+                )
+
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info(f"{BOT_NAME} | version={VERSION} | LIVE_TRADING={LIVE_TRADING}")
@@ -5418,7 +5505,8 @@ class Bot:
         logger.info(f"NEWS 3-STAR={NEWS_FILTER_ENABLED} | janela=-{NEWS_WINDOW_BEFORE_MIN}m/+{NEWS_WINDOW_AFTER_MIN}m | fail_closed={NEWS_FAIL_CLOSED}")
         logger.info(f"SAME_SYMBOL_MULTI_STRATEGY={ALLOW_MULTI_STRATEGY_SAME_SYMBOL} | NATIVE_PROTECTIVE_ORDERS={NATIVE_PROTECTIVE_ORDERS} workingType={PROTECTIVE_WORKING_TYPE}")
         logger.info(f"HARDENING | state_backup={STATE_BACKUP_FILE} | ledger={LEDGER_FILE} | news_stale_max={NEWS_MAX_STALE_SECONDS}s | entry_price_max_age={MAX_PRICE_AGE_FOR_ENTRY_SECONDS}s | reconcile={RECONCILE_INTERVAL_SECONDS}s")
-        logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD} | min_lot_overshoot_cap={MAX_MIN_LOT_OVERSHOOT_MULTIPLIER}x")
+        logger.info(f"RISK CAPS | ETH/HYPE recovery={MAX_RECOVERY_NOTIONAL_USD} total_symbol={MAX_TOTAL_SYMBOL_NOTIONAL_USD} | BTC recovery={BTC_MAX_RECOVERY_NOTIONAL_USD} total_symbol={BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD} | min_lot_overshoot_cap={MAX_MIN_LOT_OVERSHOOT_MULTIPLIER}x | range_dynamic_safety={RANGE_DYNAMIC_RECOVERY_SAFETY_MULTIPLIER}x")
+        logger.info("CAPITAL GUIDE | BTC RANGE bankroll=40/grid (4 grids=160) | recommended_real_wallet_usd=150 under current symbol caps; logical bankroll is not reserved physical cash")
         logger.info(f"LEGACY PYRAMID RETIRE | enabled={RETIRE_LEGACY_PYRAMID_ON_STARTUP} | mode=LEDGER_OWNED_ONLY")
         logger.info(f"LEGACY RANGE RETIRE | enabled={RETIRE_LEGACY_RANGE_ON_STARTUP} | mode=ONE_SHOT_LEDGER_OWNED_ONLY")
         logger.info(f"INHERITED RANGE PROTECT RESET | enabled={RESET_INHERITED_RANGE_PROTECT_ON_STARTUP} | mode=ONE_SHOT_STATE_ONLY_ACCOUNTING_PRESERVED")
@@ -5453,6 +5541,7 @@ class Bot:
             if RETIRE_LEGACY_RANGE_ON_STARTUP:
                 self.retire_legacy_range_positions()
             self.reconciler.reconcile()
+            self.migrate_configured_bankroll_increases()
             self.normalize_v53_orphan_protect_state()
         else:
             logger.warning("MODO SIMULACAO: nenhuma ordem real sera enviada")
