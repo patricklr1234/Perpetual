@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 """Production entrypoint for Perpetual Principal.
 
-Performs one narrowly-scoped, fail-closed repair for a proven stale RANGE ledger owner:
-RANGE:HYPEUSDT:G0 SHORT. Historical lot rows are preserved; only open_qty is set to 0
-when exchange physical quantity exactly matches state-represented quantity and the entire
-ledger excess is owned by the stale G0 strategy. No positions, native orders, bankrolls,
-strategy parameters, state history, BOT_DIR or Volume are changed.
+Safety fixes layered over main.py without changing strategy parameters:
+1) One narrowly-scoped, fail-closed cleanup for the already-proven stale
+   RANGE:HYPEUSDT:G0 SHORT ledger owner. Historical rows are preserved.
+2) RANGE reverse gate precheck: when a new recovery leg cannot legally be opened
+   because the operational entry gate is blocked, do NOT cancel/recreate the
+   native protection already covering the live basket. This eliminates exchange
+   TP/SL order churn while preserving the physical position and its protection.
+
+No bankroll, trigger, TP, SL, MACD, leverage, position, BOT_DIR or Volume
+parameter is changed by this wrapper.
 """
 
 import signal
-import time
 import main as bot
 
 TARGET_SYMBOL = "HYPEUSDT"
@@ -78,29 +82,19 @@ def repair_proven_stale_owner(app):
         bot.logger.info("STALE OWNER REPAIR | already clean | owner=%s", TARGET_OWNER)
         return False
     if physical1 != state_qty:
-        bot.logger.error(
-            "STALE OWNER REPAIR ABORT | physical/state differ | physical=%s state=%s",
-            physical1, state_qty,
-        )
+        bot.logger.error("STALE OWNER REPAIR ABORT | physical/state differ | physical=%s state=%s", physical1, state_qty)
         return False
     if ledger_qty - ghost_qty != physical1:
-        bot.logger.error(
-            "STALE OWNER REPAIR ABORT | excess not isolated to target owner | ledger=%s ghost=%s physical=%s",
-            ledger_qty, ghost_qty, physical1,
-        )
+        bot.logger.error("STALE OWNER REPAIR ABORT | excess not isolated to target owner | ledger=%s ghost=%s physical=%s", ledger_qty, ghost_qty, physical1)
         return False
     if _target_has_open_native_orders(app, snap1):
         bot.logger.error("STALE OWNER REPAIR ABORT | target owner still has live native orders")
         return False
 
-    # Re-snapshot immediately before mutation so an exchange-side fill cannot race the repair.
     snap2 = app.reconciler.snapshot()
     physical2 = snap2.positions.get((TARGET_SYMBOL, TARGET_SIDE), bot.D(0))
     if physical2 != physical1 or physical2 != _state_side_qty(app):
-        bot.logger.error(
-            "STALE OWNER REPAIR ABORT | physical changed during verification | before=%s after=%s state=%s",
-            physical1, physical2, _state_side_qty(app),
-        )
+        bot.logger.error("STALE OWNER REPAIR ABORT | physical changed during verification | before=%s after=%s state=%s", physical1, physical2, _state_side_qty(app))
         return False
     if _target_has_open_native_orders(app, snap2):
         bot.logger.error("STALE OWNER REPAIR ABORT | target owner live order appeared during verification")
@@ -123,25 +117,50 @@ def repair_proven_stale_owner(app):
         )
         app.ledger.db.commit()
 
-    bot.logger.warning(
-        "STALE OWNER REPAIR APPLIED | owner=%s | preserved_history_rows=%s | closed_open_qty=%s | physical=%s state=%s",
-        TARGET_OWNER, len(rows), ghost_qty, physical2, state_qty,
-    )
-
+    bot.logger.warning("STALE OWNER REPAIR APPLIED | owner=%s | preserved_history_rows=%s | closed_open_qty=%s | physical=%s state=%s", TARGET_OWNER, len(rows), ghost_qty, physical2, state_qty)
     if not app.reconciler.reconcile():
         raise RuntimeError("post-repair reconcile did not converge")
-    bot.logger.warning(
-        "STALE OWNER REPAIR VERIFIED | ledger=%s state=%s physical=%s | gate reopened if no other fault",
-        app.ledger.open_by_symbol_side(),
-        app.reconciler.expected_from_state_by_symbol_side(),
-        app.reconciler.last_snapshot.positions if app.reconciler.last_snapshot else {},
-    )
+    bot.logger.warning("STALE OWNER REPAIR VERIFIED | ledger=%s state=%s physical=%s | gate reopened if no other fault", app.ledger.open_by_symbol_side(), app.reconciler.expected_from_state_by_symbol_side(), app.reconciler.last_snapshot.positions if app.reconciler.last_snapshot else {})
     return True
+
+
+# Preserve the original recovery algorithm, but never let it cancel a live
+# bracket when the same operational gate would immediately reject _open().
+_original_range_reverse = bot.RangeEngine._reverse
+
+
+def _range_reverse_gate_safe(self, price):
+    gate_ok, gate_reason = self.store.entry_allowed()
+    if not gate_ok:
+        st = self.st()
+        basket = st.get("basket") or {}
+        sig = str(gate_reason or "ENTRY_GATE_BLOCKED")
+        if str(basket.get("last_reverse_gate_block") or "") != sig:
+            basket["last_reverse_gate_block"] = sig
+            st["last_update"] = bot.now_iso()
+            self.store.save()
+            bot.logger.warning(
+                "RANGE REVERSE GATE-SAFE HOLD | %s grid=%s | gate=%s | existing_native_protection_preserved=True",
+                self.symbol, self.grid_id, sig,
+            )
+        return
+    st = self.st()
+    basket = st.get("basket") or {}
+    if basket.get("last_reverse_gate_block") is not None:
+        basket["last_reverse_gate_block"] = None
+        st["last_update"] = bot.now_iso()
+        self.store.save()
+    return _original_range_reverse(self, price)
+
+
+bot.RangeEngine._reverse = _range_reverse_gate_safe
+bot.VERSION = f"{bot.VERSION}-range-gate-safe"
 
 
 def main():
     app = bot.Bot()
     repair_proven_stale_owner(app)
+    bot.logger.warning("RANGE GATE-SAFE PROTECTION HOLD ACTIVE | cancel/reinstall churn prevention enabled")
 
     def _sig(signum, frame):
         bot.logger.warning("SIGNAL %s recebido", signum)
