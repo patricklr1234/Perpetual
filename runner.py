@@ -9,6 +9,10 @@ Safety fixes layered over main.py without changing strategy parameters:
    because the operational entry gate is blocked, do NOT cancel/recreate the
    native protection already covering the live basket. This eliminates exchange
    TP/SL order churn while preserving the physical position and its protection.
+3) Clear the persisted RANGE:HYPEUSDT:G0 protection block only when G0 is proven
+   flat in state and ledger and owns no active native exchange order. A flat
+   strategy has no exposure requiring a protection block; leaving that stale
+   marker set can incorrectly block unrelated strategies.
 
 No bankroll, trigger, TP, SL, MACD, leverage, position, BOT_DIR or Volume
 parameter is changed by this wrapper.
@@ -124,6 +128,40 @@ def repair_proven_stale_owner(app):
     return True
 
 
+def clear_proven_stale_flat_protection_block(app):
+    """Clear only the target strategy's stale protection block when it is provably flat."""
+    if not _target_state_is_flat(app):
+        bot.logger.info("STALE PROTECTION BLOCK | skip | target state has live legs")
+        return False
+
+    if _owner_open_qty(app, TARGET_OWNER) > 0:
+        bot.logger.info("STALE PROTECTION BLOCK | skip | target ledger owner is not flat")
+        return False
+
+    snap1 = app.reconciler.snapshot()
+    if _target_has_open_native_orders(app, snap1):
+        bot.logger.info("STALE PROTECTION BLOCK | skip | target owns active native orders")
+        return False
+
+    # Re-check immediately before mutation so the cleanup is fail-closed if
+    # exposure/order state changes during verification.
+    if not _target_state_is_flat(app) or _owner_open_qty(app, TARGET_OWNER) > 0:
+        bot.logger.warning("STALE PROTECTION BLOCK | abort | target changed during verification")
+        return False
+    snap2 = app.reconciler.snapshot()
+    if _target_has_open_native_orders(app, snap2):
+        bot.logger.warning("STALE PROTECTION BLOCK | abort | target order appeared during verification")
+        return False
+
+    app.store.set_protection_block(TARGET_OWNER, None)
+    app.store.save()
+    bot.logger.warning(
+        "STALE PROTECTION BLOCK CLEARED | owner=%s | state_flat=True ledger_flat=True native_orders=False",
+        TARGET_OWNER,
+    )
+    return True
+
+
 # Preserve the original recovery algorithm, but never let it cancel a live
 # bracket when the same operational gate would immediately reject _open().
 _original_range_reverse = bot.RangeEngine._reverse
@@ -154,12 +192,13 @@ def _range_reverse_gate_safe(self, price):
 
 
 bot.RangeEngine._reverse = _range_reverse_gate_safe
-bot.VERSION = f"{bot.VERSION}-range-gate-safe"
+bot.VERSION = f"{bot.VERSION}-range-gate-safe-flat-block-clear"
 
 
 def main():
     app = bot.Bot()
     repair_proven_stale_owner(app)
+    clear_proven_stale_flat_protection_block(app)
     bot.logger.warning("RANGE GATE-SAFE PROTECTION HOLD ACTIVE | cancel/reinstall churn prevention enabled")
 
     def _sig(signum, frame):
