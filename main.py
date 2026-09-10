@@ -106,7 +106,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.46.0-v61-exact-decimal-ledger-repair"
+VERSION = "5.46.0-v61-open-orders-audit"
 BOT_NAME = "ASTER_PERPETUAL_PRINCIPAL"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -202,6 +202,7 @@ MACD_HARD_STOP_PCT = D(os.getenv("MACD_HARD_STOP_PCT", "0.02"))
 MACD_NATIVE_TRAILING_ENABLED = os.getenv("MACD_NATIVE_TRAILING_ENABLED", "1") == "1"
 TAKER_FEE_RATE = D(os.getenv("TAKER_FEE_RATE", "0.0004"))
 PROTECTIVE_WATCHDOG_SECONDS = float(os.getenv("PROTECTIVE_WATCHDOG_SECONDS", "5"))
+OPEN_ORDERS_AUDIT_SECONDS = float(os.getenv("OPEN_ORDERS_AUDIT_SECONDS", "60"))
 
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "5000"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
@@ -4772,6 +4773,125 @@ def run_internal_regression_checks() -> None:
 # BOT
 # -----------------------------------------------------------------------------
 
+# ============================================================================
+# OPEN ORDERS AUDIT (READ-ONLY OBSERVABILITY)
+# ============================================================================
+
+def _serialize_audit_deterministically(obj: Any) -> str:
+    """JSON serialize in deterministic order for consistent logging."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def extract_audit_snapshot_from_reconciler_snapshot(
+    snap: ExchangeSnapshot,
+    ledger: FillLedger,
+    capture_time: float = 0.0
+) -> Dict[str, Any]:
+    """Extract audit-ready data from exchange snapshot: positions + active orders + coverage.
+    
+    Uses EXISTING snapshot from Reconciler: no additional API calls.
+    Returns structured data for compact single-line JSON logging.
+    """
+    if not snap:
+        return {"error": "no_snapshot"}
+    
+    audit = {
+        "ts": now_iso() if capture_time == 0 else datetime.fromtimestamp(capture_time / 1000, UTC).isoformat(),
+        "positions": [],  # Physical nonzero positions
+        "orders": [],  # Active open orders (NEW, PARTIALLY_FILLED)
+        "coverage": {},  # Per-side TP/SL coverage aggregates
+    }
+    
+    # 1. Add physical nonzero positions
+    for (sym, side), qty in snap.positions.items():
+        if qty > D(0):
+            entry_price = snap.entry_prices.get((sym, side), D(0))
+            audit["positions"].append({
+                "symbol": sym,
+                "positionSide": side,
+                "qty": str(qty),
+                "entryPrice": str(entry_price),
+            })
+    
+    # 2. Add active orders (NEW or PARTIALLY_FILLED)
+    for order in snap.open_orders:
+        status = str(order.get("status", "")).upper()
+        if status not in ("NEW", "PARTIALLY_FILLED"):
+            continue
+        
+        order_id = order.get("orderId")
+        client_id = str(order.get("clientOrderId", ""))
+        order_type = str(order.get("type", ""))
+        symbol = str(order.get("symbol", "")).upper()
+        position_side = str(order.get("positionSide", "BOTH")).upper()
+        side = str(order.get("side", "")).upper()
+        
+        orig_qty = dec(order.get("origQty", 0))
+        executed_qty = dec(order.get("executedQty", 0))
+        remaining_qty = max(D(0), orig_qty - executed_qty)
+        
+        # Resolve strategy ownership from ledger
+        owner = ledger.order_owner(client_id) if client_id else None
+        owner_label = owner if owner else "UNOWNED"
+        
+        order_audit = {
+            "orderId": str(order_id) if order_id else None,
+            "clientOrderId": client_id if client_id else None,
+            "owner": owner_label,
+            "symbol": symbol,
+            "positionSide": position_side,
+            "side": side,
+            "type": order_type,
+            "status": status,
+            "origQty": str(orig_qty),
+            "executedQty": str(executed_qty),
+            "remainingQty": str(remaining_qty),
+            "stopPrice": str(dec(order.get("stopPrice", 0))),
+            "price": str(dec(order.get("price", 0))),
+            "reduceOnly": order.get("reduceOnly"),
+        }
+        
+        # Optional fields
+        if "workingType" in order:
+            order_audit["workingType"] = order["workingType"]
+        if "priceProtect" in order:
+            order_audit["priceProtect"] = order["priceProtect"]
+        
+        audit["orders"].append(order_audit)
+    
+    # 3. Compute coverage aggregates per (symbol, side)
+    coverage_key_map: Dict[Tuple[str, str, str], D] = {}  # (symbol, side, type) -> qty
+    for order in snap.open_orders:
+        status = str(order.get("status", "")).upper()
+        if status not in ("NEW", "PARTIALLY_FILLED"):
+            continue
+        
+        order_type = str(order.get("type", "")).upper()
+        if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            continue
+        
+        symbol = str(order.get("symbol", "")).upper()
+        position_side = str(order.get("positionSide", "BOTH")).upper()
+        if position_side not in ("LONG", "SHORT"):
+            position_side = "BOTH"
+        
+        orig_qty = dec(order.get("origQty", 0))
+        executed_qty = dec(order.get("executedQty", 0))
+        remaining_qty = max(D(0), orig_qty - executed_qty)
+        
+        key = (symbol, position_side, order_type)
+        coverage_key_map[key] = coverage_key_map.get(key, D(0)) + remaining_qty
+    
+    for (sym, pos_side, order_type), qty in coverage_key_map.items():
+        if qty <= D(0):
+            continue
+        key = f"{sym}:{pos_side}"
+        if key not in audit["coverage"]:
+            audit["coverage"][key] = {}
+        audit["coverage"][key][order_type] = str(qty)
+    
+    return audit
+
+
 class Bot:
     def __init__(self):
         # Fail fast before constructing components that may read/write persistent state.
@@ -4793,6 +4913,7 @@ class Bot:
                 )
         self.exe = ExecutionEngine(self.client, self.account, self.rules, self.store, self.ledger)
         self._last_periodic_reconcile_ms = 0
+        self._last_audit_ms = 0
         self.reconciler = Reconciler(self.client, self.store, self.ledger, self.rules, self.exe)
         self.range_engines: List[RangeEngine] = []
         self.macd_engines: List[MacdEngine] = []
@@ -6355,6 +6476,19 @@ class Bot:
                     self._last_periodic_reconcile_ms = _now_reconcile
                     try:
                         self.reconciler.reconcile()
+                        # Trigger audit if using the same snapshot
+                        _audit_snapshot = self.reconciler.last_snapshot
+                        if _audit_snapshot:
+                            _now_audit = now_ms()
+                            if _now_audit - self._last_audit_ms >= int(OPEN_ORDERS_AUDIT_SECONDS * 1000):
+                                self._last_audit_ms = _now_audit
+                                try:
+                                    _audit_data = extract_audit_snapshot_from_reconciler_snapshot(
+                                        _audit_snapshot, self.ledger, _audit_snapshot.captured_ms
+                                    )
+                                    logger.info(f"OPEN_ORDERS_AUDIT | {_serialize_audit_deterministically(_audit_data)}")
+                                except Exception as _audit_err:
+                                    logger.warning(f"AUDIT EXTRACTION FAIL | {_audit_err}")
                     except Exception as _re:
                         reason = f"RECONCILE_UNAVAILABLE:{type(_re).__name__}:{_re}"
                         with self.store.lock:
