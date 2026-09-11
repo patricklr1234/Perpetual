@@ -7,12 +7,14 @@ Safety fixes layered over main.py without changing strategy parameters:
    RANGE:HYPEUSDT:G0 SHORT ledger owner. Historical rows are preserved.
 2) RANGE reverse gate precheck: when a new recovery leg cannot legally be opened
    because the operational entry gate is blocked, do NOT cancel/recreate the
-   native protection already covering the live basket. This eliminates exchange
-   TP/SL order churn while preserving the physical position and its protection.
+   native protection already covering the live basket.
 3) Clear the persisted RANGE:HYPEUSDT:G0 protection block only when G0 is proven
-   flat in state and ledger and owns no active native exchange order. A flat
-   strategy has no exposure requiring a protection block; leaving that stale
-   marker set can incorrectly block unrelated strategies.
+   flat in state and ledger and owns no active native exchange order.
+4) MACD STOP_MARKET installation is idempotent: an already-live exchange stop
+   owned by the same MACD strategy, on the same side, quantity and requested
+   trigger is reused instead of creating a duplicate. Exact duplicate stops are
+   safely reduced to one only after a keeper is proven live. A one-shot startup
+   cleanup applies the same rule to duplicates left by the prior watchdog bug.
 
 No bankroll, trigger, TP, SL, MACD, leverage, position, BOT_DIR or Volume
 parameter is changed by this wrapper.
@@ -129,11 +131,9 @@ def repair_proven_stale_owner(app):
 
 
 def clear_proven_stale_flat_protection_block(app):
-    """Clear only the target strategy's stale protection block when it is provably flat."""
     if not _target_state_is_flat(app):
         bot.logger.info("STALE PROTECTION BLOCK | skip | target state has live legs")
         return False
-
     if _owner_open_qty(app, TARGET_OWNER) > 0:
         bot.logger.info("STALE PROTECTION BLOCK | skip | target ledger owner is not flat")
         return False
@@ -142,9 +142,6 @@ def clear_proven_stale_flat_protection_block(app):
     if _target_has_open_native_orders(app, snap1):
         bot.logger.info("STALE PROTECTION BLOCK | skip | target owns active native orders")
         return False
-
-    # Re-check immediately before mutation so the cleanup is fail-closed if
-    # exposure/order state changes during verification.
     if not _target_state_is_flat(app) or _owner_open_qty(app, TARGET_OWNER) > 0:
         bot.logger.warning("STALE PROTECTION BLOCK | abort | target changed during verification")
         return False
@@ -192,14 +189,199 @@ def _range_reverse_gate_safe(self, price):
 
 
 bot.RangeEngine._reverse = _range_reverse_gate_safe
-bot.VERSION = f"{bot.VERSION}-range-gate-safe-flat-block-clear"
+
+
+# -----------------------------------------------------------------------------
+# MACD native stop idempotency / duplicate repair
+# -----------------------------------------------------------------------------
+
+_original_install_stop_only = bot.ExecutionEngine.install_stop_only
+
+
+def _active_owner_stops(exe, strategy_id, symbol, position_side):
+    rows = exe.client.open_orders(symbol)
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for row in rows:
+        if str(row.get("symbol") or symbol).upper() != symbol.upper():
+            continue
+        if str(row.get("positionSide") or "").upper() != position_side.upper():
+            continue
+        if str(row.get("type") or "").upper() != "STOP_MARKET":
+            continue
+        if str(row.get("status") or "NEW").upper() not in ("NEW", "PARTIALLY_FILLED"):
+            continue
+        cid = str(row.get("clientOrderId") or row.get("origClientOrderId") or "")
+        if not cid or exe.ledger.order_owner(cid) != strategy_id:
+            continue
+        remaining = max(bot.D(0), bot.dec(row.get("origQty")) - bot.dec(row.get("executedQty")))
+        item = dict(row)
+        item["_cid"] = cid
+        item["_remaining"] = remaining
+        item["_stop"] = bot.dec(row.get("stopPrice"))
+        out.append(item)
+    return out
+
+
+def _stop_meta_from_exchange(row, requested_qty, reason):
+    return {
+        "client_id": row["_cid"],
+        "order_id": row.get("orderId"),
+        "stop_price": str(row["_stop"]),
+        "type": "STOP_MARKET",
+        "status": str(row.get("status") or "NEW").upper(),
+        "working_type": str(row.get("workingType") or bot.PROTECTIVE_WORKING_TYPE),
+        "qty": str(requested_qty),
+        "installed_at": bot.now_iso(),
+        "reason": reason,
+    }
+
+
+def _cancel_exact_duplicate_stops(exe, strategy_id, symbol, side, keeper, duplicates):
+    for row in duplicates:
+        if row["_cid"] == keeper["_cid"]:
+            continue
+        try:
+            exe.cancel_and_confirm_terminal(symbol, row["_cid"])
+            bot.logger.warning(
+                "MACD DUPLICATE STOP CANCELED | %s | %s %s | keep=%s canceled=%s stop=%s qty=%s",
+                strategy_id, symbol, side, keeper["_cid"], row["_cid"], row["_stop"], row["_remaining"],
+            )
+        except Exception as exc:
+            # Keeper was already proven live. Do not cancel it and do not alter exposure.
+            bot.logger.error(
+                "MACD DUPLICATE STOP CLEANUP FAIL | %s | keep=%s duplicate=%s | %s",
+                strategy_id, keeper["_cid"], row["_cid"], exc,
+            )
+
+
+def _install_stop_only_idempotent(self, strategy_id, symbol, leg, stop_price, reason="STOP_LOSS"):
+    if not bot.NATIVE_PROTECTIVE_ORDERS or not bot.LIVE_TRADING:
+        return _original_install_stop_only(self, strategy_id, symbol, leg, stop_price, reason)
+
+    side = str(leg["side"]).upper()
+    qty = bot.dec(leg["qty"])
+    if qty <= 0:
+        return None
+    direction = "DOWN" if side == "LONG" else "UP"
+    requested_stop = self.rules.trigger_price(symbol, stop_price, direction)
+    tick = self.rules.rules[symbol].tick_size
+
+    try:
+        candidates = _active_owner_stops(self, strategy_id, symbol, side)
+    except Exception as exc:
+        bot.logger.warning("MACD STOP IDEMPOTENCY LOOKUP UNKNOWN | %s | %s", strategy_id, exc)
+        return _original_install_stop_only(self, strategy_id, symbol, leg, stop_price, reason)
+
+    exact = [
+        r for r in candidates
+        if r["_remaining"] >= qty and abs(r["_stop"] - requested_stop) < tick
+    ]
+    if exact:
+        # Prefer the oldest/smallest order id deterministically. All exact matches
+        # have the same protection price and sufficient remaining quantity.
+        exact.sort(key=lambda r: (str(r.get("time") or ""), str(r.get("orderId") or ""), r["_cid"]))
+        keeper = exact[0]
+        if len(exact) > 1:
+            _cancel_exact_duplicate_stops(self, strategy_id, symbol, side, keeper, exact[1:])
+        bot.logger.info(
+            "MACD STOP IDEMPOTENT REUSE | %s | %s %s qty=%s stop=%s cid=%s duplicates=%s",
+            strategy_id, symbol, side, qty, requested_stop, keeper["_cid"], max(0, len(exact) - 1),
+        )
+        return _stop_meta_from_exchange(keeper, qty, reason)
+
+    return _original_install_stop_only(self, strategy_id, symbol, leg, stop_price, reason)
+
+
+bot.ExecutionEngine.install_stop_only = _install_stop_only_idempotent
+
+
+def cleanup_existing_macd_stop_duplicates(app):
+    """One-shot startup cleanup for exact duplicate live MACD stops.
+
+    Only orders whose durable ledger owner starts with MACD: are considered. For
+    each owner/side/stop-price group, one live stop is kept and all others are
+    canceled only after the keeper is observed in the same exchange snapshot.
+    Different stop prices are left untouched because they may represent a valid
+    in-flight trailing replacement.
+    """
+    snap = app.reconciler.snapshot()
+    grouped = {}
+    for row in snap.open_orders or []:
+        if str(row.get("type") or "").upper() != "STOP_MARKET":
+            continue
+        if str(row.get("status") or "NEW").upper() not in ("NEW", "PARTIALLY_FILLED"):
+            continue
+        cid = str(row.get("clientOrderId") or row.get("origClientOrderId") or "")
+        if not cid:
+            continue
+        owner = app.ledger.order_owner(cid)
+        if not owner or not str(owner).startswith("MACD:"):
+            continue
+        symbol = str(row.get("symbol") or "").upper()
+        side = str(row.get("positionSide") or "").upper()
+        stop = bot.dec(row.get("stopPrice"))
+        remaining = max(bot.D(0), bot.dec(row.get("origQty")) - bot.dec(row.get("executedQty")))
+        if not symbol or side not in ("LONG", "SHORT") or stop <= 0 or remaining <= 0:
+            continue
+        key = (str(owner), symbol, side, str(stop))
+        item = dict(row)
+        item["_cid"] = cid
+        item["_remaining"] = remaining
+        item["_stop"] = stop
+        grouped.setdefault(key, []).append(item)
+
+    cleaned = 0
+    for (owner, symbol, side, stop), rows in grouped.items():
+        if len(rows) <= 1:
+            continue
+        rows.sort(key=lambda r: (str(r.get("time") or ""), str(r.get("orderId") or ""), r["_cid"]))
+        keeper = rows[0]
+        # Fail closed: prove the keeper still exists immediately before touching siblings.
+        try:
+            live = app.client.query_order(symbol, keeper["_cid"])
+            if str(live.get("status") or "").upper() not in ("NEW", "PARTIALLY_FILLED"):
+                bot.logger.error("MACD STARTUP DUPLICATE CLEANUP ABORT | %s | keeper not live=%s", owner, live)
+                continue
+        except Exception as exc:
+            bot.logger.error("MACD STARTUP DUPLICATE CLEANUP ABORT | %s | keeper verify failed | %s", owner, exc)
+            continue
+        for dup in rows[1:]:
+            try:
+                app.exe.cancel_and_confirm_terminal(symbol, dup["_cid"])
+                cleaned += 1
+                bot.logger.warning(
+                    "MACD STARTUP DUPLICATE STOP CANCELED | %s | %s %s | keep=%s canceled=%s stop=%s",
+                    owner, symbol, side, keeper["_cid"], dup["_cid"], stop,
+                )
+            except Exception as exc:
+                bot.logger.error(
+                    "MACD STARTUP DUPLICATE STOP CLEANUP FAIL | %s | keep=%s duplicate=%s | %s",
+                    owner, keeper["_cid"], dup["_cid"], exc,
+                )
+
+    if cleaned:
+        verify = app.reconciler.snapshot()
+        bot.logger.warning(
+            "MACD STARTUP DUPLICATE STOP CLEANUP VERIFIED | canceled=%s | physical=%s",
+            cleaned, verify.positions,
+        )
+    else:
+        bot.logger.info("MACD STARTUP DUPLICATE STOP CLEANUP | no exact duplicates found")
+    return cleaned
+
+
+bot.VERSION = f"{bot.VERSION}-range-gate-safe-flat-block-clear-macd-stop-idempotent"
 
 
 def main():
     app = bot.Bot()
     repair_proven_stale_owner(app)
     clear_proven_stale_flat_protection_block(app)
+    cleanup_existing_macd_stop_duplicates(app)
     bot.logger.warning("RANGE GATE-SAFE PROTECTION HOLD ACTIVE | cancel/reinstall churn prevention enabled")
+    bot.logger.warning("MACD STOP IDEMPOTENCY ACTIVE | duplicate STOP_MARKET prevention/cleanup enabled")
 
     def _sig(signum, frame):
         bot.logger.warning("SIGNAL %s recebido", signum)
